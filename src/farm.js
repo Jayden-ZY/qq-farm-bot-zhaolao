@@ -93,6 +93,27 @@ async function insecticide(landIds) {
 // 普通肥料 ID
 const NORMAL_FERTILIZER_ID = 1011;
 
+async function getNormalFertilizerCount() {
+    try {
+        const body = types.BagRequest.encode(types.BagRequest.create({})).finish();
+        const { body: replyBody } = await sendMsgAsync('gamepb.itempb.ItemService', 'Bag', body);
+        const bagReply = types.BagReply.decode(replyBody);
+        const items = (bagReply.item_bag && bagReply.item_bag.items && bagReply.item_bag.items.length)
+            ? bagReply.item_bag.items
+            : (bagReply.items || []);
+
+        for (const item of items) {
+            if (toNum(item.id) === NORMAL_FERTILIZER_ID) {
+                const count = toNum(item.count);
+                return Number.isFinite(count) && count >= 0 ? count : 0;
+            }
+        }
+        return 0;
+    } catch (e) {
+        return null;
+    }
+}
+
 /**
  * 施肥 - 必须逐块进行，服务器不支持批量
  * 游戏中拖动施肥间隔很短，这里用 50ms
@@ -113,6 +134,22 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
         }
         if (landIds.length > 1) await sleep(50);  // 50ms 间隔
     }
+
+    if (fertilizerId === NORMAL_FERTILIZER_ID && landIds.length > 0) {
+        const remaining = await getNormalFertilizerCount();
+        if (Number.isFinite(remaining)) {
+            if (remaining > 0) {
+                log('施肥', `FERT_STATUS normal_count=${remaining}`);
+            } else {
+                log('施肥', 'FERT_STATUS low normal_count=0');
+            }
+        } else if (successCount >= landIds.length) {
+            log('施肥', 'FERT_STATUS ok');
+        } else {
+            log('施肥', 'FERT_STATUS low');
+        }
+    }
+
     return successCount;
 }
 
