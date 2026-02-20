@@ -1,4 +1,4 @@
-/**
+﻿/**
  * QQ经典农场 挂机脚本 - 入口文件
  *
  * 模块结构:
@@ -11,6 +11,8 @@
  *   src/decode.js   - PB解码/验证工具模式
  */
 
+const fs = require('fs');
+const path = require('path');
 const { CONFIG } = require('./src/config');
 const { loadProto } = require('./src/proto');
 const { connect, cleanup, getWs } = require('./src/network');
@@ -21,11 +23,82 @@ const { initStatusBar, cleanupStatusBar, setStatusPlatform } = require('./src/st
 const { startSellLoop, stopSellLoop, debugSellFruits } = require('./src/warehouse');
 const { processInviteCodes } = require('./src/invite');
 const { verifyMode, decodeMode } = require('./src/decode');
-const { emitRuntimeHint, sleep } = require('./src/utils');
+const { emitRuntimeHint } = require('./src/utils');
 const { getQQFarmCodeByScan } = require('./src/qqQrLogin');
 const { initFileLogger } = require('./src/logger');
 
 initFileLogger();
+
+const LOCK_FILE = path.join(__dirname, '.bot.lock');
+let lockAcquired = false;
+let shuttingDown = false;
+
+function pidExists(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (e) {
+        return e.code === 'EPERM';
+    }
+}
+
+function acquireSingleInstanceLock() {
+    if (fs.existsSync(LOCK_FILE)) {
+        try {
+            const oldPid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8').trim(), 10);
+            if (Number.isInteger(oldPid) && oldPid > 0 && pidExists(oldPid)) {
+                console.error(`[启动] 检测到已有实例运行 (pid=${oldPid})，请先停止旧进程，或使用 --allow-multi`);
+                process.exit(1);
+            }
+        } catch (e) {
+            // ignore stale lock parse error
+        }
+        try {
+            fs.unlinkSync(LOCK_FILE);
+        } catch (e) {
+            // ignore stale lock cleanup error
+        }
+    }
+
+    try {
+        fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
+        lockAcquired = true;
+    } catch (e) {
+        if (e.code === 'EEXIST') {
+            console.error('[启动] 检测到已有实例运行，请先停止旧进程');
+            process.exit(1);
+        }
+        throw e;
+    }
+}
+
+function releaseSingleInstanceLock() {
+    if (!lockAcquired) return;
+    try {
+        fs.unlinkSync(LOCK_FILE);
+    } catch (e) {
+        // ignore
+    }
+    lockAcquired = false;
+}
+
+function gracefulShutdown(exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    cleanupStatusBar();
+    console.log('\n[退出] 正在断开...');
+    stopFarmCheckLoop();
+    stopFriendCheckLoop();
+    cleanupTaskSystem();
+    stopSellLoop();
+    cleanup();
+
+    const ws = getWs();
+    if (ws) ws.close();
+    releaseSingleInstanceLock();
+    process.exit(exitCode);
+}
 
 // ============ 帮助信息 ============
 function showHelp() {
@@ -34,33 +107,21 @@ QQ经典农场 挂机脚本
 ====================
 
 用法:
-  node client.js --code <登录code> [--wx] [--interval <秒>] [--friend-interval <秒>]
+  node client.js --code <登录code> [--wx] [--interval <秒>] [--friend-interval <秒>] [--seed-id <ID>]
   node client.js --qr [--interval <秒>] [--friend-interval <秒>]
   node client.js --verify
   node client.js --decode <数据> [--hex] [--gate] [--type <消息类型>]
 
 参数:
-  --code              小程序 login() 返回的临时凭证 (必需)
+  --code              小程序 login() 返回的临时凭证
   --qr                启动后使用QQ扫码获取登录code（仅QQ平台）
   --wx                使用微信登录 (默认为QQ小程序)
-  --interval          自己农场巡查完成后等待秒数, 默认10秒, 最低10秒
-  --friend-interval   好友巡查完成后等待秒数, 默认1秒, 最低1秒
+  --interval          自己农场巡查完成后等待秒数
+  --friend-interval   好友巡查完成后等待秒数
+  --seed-id           指定种子ID，0表示自动策略
+  --allow-multi       允许同目录下多开实例 (默认禁止，避免同号互踢)
   --verify            验证proto定义
   --decode            解码PB数据 (运行 --decode 无参数查看详细帮助)
-
-功能:
-  - 自动收获成熟作物 → 购买种子 → 种植 → 施肥
-  - 自动除草、除虫、浇水
-  - 自动铲除枯死作物
-  - 自动巡查好友农场: 帮忙浇水/除草/除虫 + 偷菜
-  - 自动领取任务奖励 (支持分享翻倍)
-  - 每分钟自动出售仓库果实
-  - 启动时读取 share.txt 处理邀请码 (仅微信)
-  - 心跳保活
-
-邀请码文件 (share.txt):
-  每行一个邀请链接，格式: ?uid=xxx&openid=xxx&share_source=xxx&doc_id=xxx
-  启动时会尝试通过 SyncAll API 同步这些好友
 `);
 }
 
@@ -69,10 +130,7 @@ function parseArgs(args) {
     const options = {
         code: '',
         qrLogin: false,
-        deleteAccountMode: false,
-        name: '',
-        certId: '',
-        certType: 0,
+        allowMulti: false,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -82,18 +140,28 @@ function parseArgs(args) {
         if (args[i] === '--qr') {
             options.qrLogin = true;
         }
+        if (args[i] === '--allow-multi') {
+            options.allowMulti = true;
+        }
         if (args[i] === '--wx') {
             CONFIG.platform = 'wx';
         }
         if (args[i] === '--interval' && args[i + 1]) {
-            const sec = parseInt(args[++i]);
+            const sec = parseInt(args[++i], 10);
             CONFIG.farmCheckInterval = Math.max(sec, 1) * 1000;
         }
         if (args[i] === '--friend-interval' && args[i + 1]) {
-            const sec = parseInt(args[++i]);
-            CONFIG.friendCheckInterval = Math.max(sec, 1) * 1000;  // 最低1秒
+            const sec = parseInt(args[++i], 10);
+            CONFIG.friendCheckInterval = Math.max(sec, 1) * 1000;
+        }
+        if (args[i] === '--seed-id' && args[i + 1]) {
+            const seedId = parseInt(args[++i], 10);
+            if (Number.isInteger(seedId) && seedId >= 0) {
+                CONFIG.targetSeedId = seedId;
+            }
         }
     }
+
     return options;
 }
 
@@ -135,16 +203,16 @@ async function main() {
         showHelp();
         process.exit(1);
     }
-    if (options.deleteAccountMode && (!options.name || !options.certId)) {
-        console.log('[参数] 注销账号模式必须提供 --name 和 --cert-id');
-        showHelp();
-        process.exit(1);
-    }
 
     // 扫码阶段结束后清屏，避免状态栏覆盖二维码区域导致界面混乱
     if (usedQrLogin && process.stdout.isTTY) {
         process.stdout.write('\x1b[2J\x1b[H');
     }
+
+    if (!options.allowMulti) {
+        acquireSingleInstanceLock();
+    }
+    process.on('exit', releaseSingleInstanceLock);
 
     // 初始化状态栏
     initStatusBar();
@@ -158,32 +226,23 @@ async function main() {
     connect(options.code, async () => {
         // 处理邀请码 (仅微信环境)
         await processInviteCodes();
-        
+
         startFarmCheckLoop();
         startFriendCheckLoop();
         initTaskSystem();
-        
+
         // 启动时立即检查一次背包
         setTimeout(() => debugSellFruits(), 5000);
         startSellLoop(60000);  // 每分钟自动出售仓库果实
     });
 
     // 退出处理
-    process.on('SIGINT', () => {
-        cleanupStatusBar();
-        console.log('\n[退出] 正在断开...');
-        stopFarmCheckLoop();
-        stopFriendCheckLoop();
-        cleanupTaskSystem();
-        stopSellLoop();
-        cleanup();
-        const ws = getWs();
-        if (ws) ws.close();
-        process.exit(0);
-    });
+    process.on('SIGINT', () => gracefulShutdown(0));
+    process.on('SIGTERM', () => gracefulShutdown(0));
 }
 
-main().catch(err => {
+main().catch((err) => {
     console.error('启动失败:', err);
+    releaseSingleInstanceLock();
     process.exit(1);
 });

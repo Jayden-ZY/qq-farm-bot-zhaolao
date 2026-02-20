@@ -18,6 +18,16 @@ let clientSeq = 1;
 let serverSeq = 0;
 let heartbeatTimer = null;
 let pendingCallbacks = new Map();
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let manualClosed = false;
+let connectCode = '';
+let connectOpenID = '';
+let loginSuccessHandler = null;
+let initialLoginDone = false;
+
+const RECONNECT_BASE_DELAY = 2000;
+const RECONNECT_MAX_DELAY = 30000;
 
 // ============ 用户状态 (登录后设置) ============
 const userState = {
@@ -29,6 +39,25 @@ const userState = {
 };
 
 function getUserState() { return userState; }
+
+function resetSeqState() {
+    clientSeq = 1;
+    serverSeq = 0;
+}
+
+function clearHeartbeatTimer() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
+}
+
+function clearPendingCallbacks(message = '连接已断开，已清理') {
+    pendingCallbacks.forEach((cb) => {
+        try { cb(new Error(message)); } catch (e) { }
+    });
+    pendingCallbacks.clear();
+}
 
 // ============ 消息编解码 ============
 function encodeMsg(serviceName, methodName, bodyBytes) {
@@ -55,8 +84,15 @@ function sendMsg(serviceName, methodName, bodyBytes, callback) {
     const seq = clientSeq;
     const encoded = encodeMsg(serviceName, methodName, bodyBytes);
     if (callback) pendingCallbacks.set(seq, callback);
-    ws.send(encoded);
-    return true;
+    try {
+        ws.send(encoded);
+        return true;
+    } catch (e) {
+        if (callback) pendingCallbacks.delete(seq);
+        logWarn('WS', `发送失败: ${e.message}`);
+        scheduleReconnect('send failed', true);
+        return false;
+    }
 }
 
 /** Promise 版发送 */
@@ -112,6 +148,7 @@ function handleMessage(data) {
 
         // Response
         if (msgType === 2) {
+            lastHeartbeatResponse = Date.now();
             const errorCode = toNum(meta.error_code);
             const clientSeqVal = toNum(meta.client_seq);
 
@@ -309,7 +346,7 @@ function handleNotify(msg) {
 }
 
 // ============ 登录 ============
-function sendLogin(onLoginSuccess) {
+function sendLogin() {
     const body = types.LoginRequest.encode(types.LoginRequest.create({
         sharer_id: toLong(0),
         sharer_open_id: '',
@@ -322,9 +359,10 @@ function sendLogin(onLoginSuccess) {
         },
     })).finish();
 
-    sendMsg('gamepb.userpb.UserService', 'Login', body, (err, bodyBytes, meta) => {
+    const sent = sendMsg('gamepb.userpb.UserService', 'Login', body, (err, bodyBytes) => {
         if (err) {
             log('登录', `失败: ${err.message}`);
+            scheduleReconnect('login failed');
             return;
         }
         try {
@@ -359,11 +397,26 @@ function sendLogin(onLoginSuccess) {
             }
 
             startHeartbeat();
-            if (onLoginSuccess) onLoginSuccess();
+            reconnectAttempts = 0;
+            if (!initialLoginDone) {
+                initialLoginDone = true;
+                if (loginSuccessHandler) {
+                    Promise.resolve(loginSuccessHandler()).catch((e) => {
+                        logWarn('登录', `启动后初始化失败: ${e.message}`);
+                    });
+                }
+            } else {
+                log('WS', '重连成功，已恢复运行');
+            }
         } catch (e) {
             log('登录', `解码失败: ${e.message}`);
+            scheduleReconnect('login decode failed');
         }
     });
+
+    if (!sent) {
+        scheduleReconnect('login send failed');
+    }
 }
 
 // ============ 心跳 ============
@@ -385,11 +438,7 @@ function startHeartbeat() {
             logWarn('心跳', `连接可能已断开 (${Math.round(timeSinceLastResponse/1000)}s 无响应, pending=${pendingCallbacks.size})`);
             if (heartbeatMissCount >= 2) {
                 log('心跳', '尝试重连...');
-                // 清理待处理的回调，避免堆积
-                pendingCallbacks.forEach((cb, seq) => {
-                    try { cb(new Error('连接超时，已清理')); } catch (e) {}
-                });
-                pendingCallbacks.clear();
+                scheduleReconnect('heartbeat timeout', true);
             }
         }
         
@@ -397,7 +446,7 @@ function startHeartbeat() {
             gid: toLong(userState.gid),
             client_version: CONFIG.clientVersion,
         })).finish();
-        sendMsg('gamepb.userpb.UserService', 'Heartbeat', body, (err, replyBody) => {
+        const sent = sendMsg('gamepb.userpb.UserService', 'Heartbeat', body, (err, replyBody) => {
             if (err || !replyBody) return;
             lastHeartbeatResponse = Date.now();
             heartbeatMissCount = 0;
@@ -406,43 +455,137 @@ function startHeartbeat() {
                 if (reply.server_time) syncServerTime(toNum(reply.server_time));
             } catch (e) { }
         });
+        if (!sent) {
+            scheduleReconnect('heartbeat send failed', true);
+        }
     }, CONFIG.heartbeatInterval);
 }
 
 // ============ WebSocket 连接 ============
-function connect(code, onLoginSuccess) {
-    const url = `${CONFIG.serverUrl}?platform=${CONFIG.platform}&os=${CONFIG.os}&ver=${CONFIG.clientVersion}&code=${code}&openID=`;
+function buildConnectUrl(code, openID = '') {
+    return openID
+        ? `${CONFIG.serverUrl}?platform=${CONFIG.platform}&os=${CONFIG.os}&ver=${CONFIG.clientVersion}&code=${code}&openID=${openID}`
+        : `${CONFIG.serverUrl}?platform=${CONFIG.platform}&os=${CONFIG.os}&ver=${CONFIG.clientVersion}&code=${code}`;
+}
 
-    ws = new WebSocket(url, {
+function scheduleReconnect(reason = 'unknown', immediate = false) {
+    if (manualClosed || !connectCode) return;
+    if (reconnectTimer) return;
+
+    clearHeartbeatTimer();
+    clearPendingCallbacks('连接超时，已清理');
+
+    reconnectAttempts++;
+    const delay = immediate
+        ? 0
+        : Math.min(RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttempts - 1), RECONNECT_MAX_DELAY);
+    log('WS', `准备重连 (${reason})，${delay}ms 后重试`);
+
+    const current = ws;
+    if (current) {
+        try { current.terminate(); } catch (e) { }
+    }
+    ws = null;
+
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        openSocket(true);
+    }, delay);
+}
+
+function openSocket(isReconnect = false) {
+    const url = buildConnectUrl(connectCode, connectOpenID);
+    if (!isReconnect) {
+        console.log("[WS] connect url =", url);
+    } else {
+        log('WS', `重连 url = ${url}`);
+    }
+
+    const socket = new WebSocket(url, {
         headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)',
             'Origin': 'https://gate-obt.nqf.qq.com',
         },
     });
 
-    ws.binaryType = 'arraybuffer';
+    ws = socket;
+    socket.binaryType = 'arraybuffer';
+    resetSeqState();
 
-    ws.on('open', () => {
-        sendLogin(onLoginSuccess);
+    socket.on('open', () => {
+        if (socket !== ws) return;
+        lastHeartbeatResponse = Date.now();
+        heartbeatMissCount = 0;
+        sendLogin();
     });
 
-    ws.on('message', (data) => {
+    socket.on('message', (data) => {
+        if (socket !== ws) return;
         handleMessage(Buffer.isBuffer(data) ? data : Buffer.from(data));
     });
 
-    ws.on('close', (code, reason) => {
+    socket.on('close', (code) => {
+        if (socket !== ws) return;
         console.log(`[WS] 连接关闭 (code=${code})`);
-        cleanup();
+        ws = null;
+        clearHeartbeatTimer();
+        clearPendingCallbacks('连接已关闭，已清理');
+        if (!manualClosed) {
+            scheduleReconnect(`close code=${code}`);
+        }
     });
 
-    ws.on('error', (err) => {
+    socket.on('error', (err) => {
+        if (socket !== ws) return;
         logWarn('WS', `错误: ${err.message}`);
+        if (!manualClosed && socket.readyState !== WebSocket.OPEN) {
+            scheduleReconnect(`error: ${err.message}`);
+        }
     });
 }
 
+function connect(code, onLoginSuccess, openID = '') {
+    manualClosed = false;
+    connectCode = code;
+    connectOpenID = openID;
+    loginSuccessHandler = onLoginSuccess;
+    initialLoginDone = false;
+    reconnectAttempts = 0;
+
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    const current = ws;
+    ws = null;
+    if (current) {
+        try {
+            current.removeAllListeners();
+            current.terminate();
+        } catch (e) { }
+    }
+
+    openSocket(false);
+}
+
 function cleanup() {
-    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-    pendingCallbacks.clear();
+    manualClosed = true;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    clearHeartbeatTimer();
+    clearPendingCallbacks('客户端退出，已清理');
+
+    const current = ws;
+    ws = null;
+    if (current) {
+        try {
+            current.removeAllListeners();
+            current.close();
+        } catch (e) { }
+    }
 }
 
 function getWs() { return ws; }

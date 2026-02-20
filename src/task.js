@@ -7,6 +7,18 @@ const { sendMsgAsync, networkEvents } = require('./network');
 const { toLong, toNum, log, logWarn, sleep } = require('./utils');
 const { getItemName } = require('./gameConfig');
 
+function extractErrorCode(err) {
+    const msg = String((err && err.message) || err || '');
+    const m = msg.match(/code=(\d+)/);
+    return m ? Number(m[1]) : 0;
+}
+
+function shouldIgnoreTaskClaimError(err) {
+    const code = extractErrorCode(err);
+    // 任务状态刷新存在延迟，这两类错误属于可忽略噪音
+    return code === 1008001 || code === 1008002;
+}
+
 // ============ 任务 API ============
 
 async function getTaskInfo() {
@@ -112,7 +124,9 @@ async function checkAndClaimTasks() {
                 log('任务', `领取: ${task.desc}${multipleStr} → ${rewardStr}`);
                 await sleep(300);
             } catch (e) {
-                logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
+                if (!shouldIgnoreTaskClaimError(e)) {
+                    logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
+                }
             }
         }
     } catch (e) {
@@ -156,7 +170,9 @@ async function claimTasksFromList(claimable) {
             log('任务', `领取: ${task.desc}${multipleStr} → ${rewardStr}`);
             await sleep(300);
         } catch (e) {
-            logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
+            if (!shouldIgnoreTaskClaimError(e)) {
+                logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
+            }
         }
     }
 }

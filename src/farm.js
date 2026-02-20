@@ -1,14 +1,28 @@
-/**
+﻿/**
  * 自己的农场操作 - 收获/浇水/除草/除虫/铲除/种植/商店/巡田
  */
 
 const protobuf = require('protobufjs');
+const fs = require('fs');
+const path = require('path');
 const { CONFIG, PlantPhase, PHASE_NAMES } = require('./config');
 const { types } = require('./proto');
 const { sendMsgAsync, getUserState, networkEvents } = require('./network');
 const { toLong, toNum, getServerTimeSec, toTimeSec, log, logWarn, sleep } = require('./utils');
+const { updateStatusGold } = require('./status');
 const { getPlantNameBySeedId, getPlantName, getPlantExp, formatGrowTime, getPlantGrowTime, getItemName } = require('./gameConfig');
 const { getPlantingRecommendation } = require('../tools/calc-exp-yield');
+
+const WEBUI_CONFIG_PATH = path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+let webuiConfigMtimeMs = -1;
+let webuiConfigCache = null;
+let lastSeedFallbackKey = '';
+
+const BENIGN_ACTION_ERROR_CODES = {
+    浇水: new Set([1001012]),
+    除草: new Set([1001015]),
+    除虫: new Set([1001018]),
+};
 
 // ============ 内部状态 ============
 let isCheckingFarm = false;
@@ -164,6 +178,75 @@ async function plantSeeds(seedId, landIds) {
     return successCount;
 }
 
+function normalizeSeedId(value) {
+    const n = Number(value);
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+}
+
+function normalizeIntervalSec(value, fallbackSec) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallbackSec;
+    return Math.min(Math.max(Math.floor(n), 1), 300);
+}
+
+function readWebuiConfig() {
+    try {
+        const stat = fs.statSync(WEBUI_CONFIG_PATH);
+        if (stat.mtimeMs === webuiConfigMtimeMs) {
+            return webuiConfigCache;
+        }
+
+        const parsed = JSON.parse(fs.readFileSync(WEBUI_CONFIG_PATH, 'utf8')) || {};
+        webuiConfigMtimeMs = stat.mtimeMs;
+        webuiConfigCache = typeof parsed === 'object' && parsed ? parsed : {};
+        return webuiConfigCache;
+    } catch (err) {
+        webuiConfigMtimeMs = -1;
+        webuiConfigCache = null;
+        return null;
+    }
+}
+
+function getPreferredSeedId() {
+    const cfg = readWebuiConfig();
+    if (cfg && Object.prototype.hasOwnProperty.call(cfg, 'preferredSeedId')) {
+        return normalizeSeedId(cfg.preferredSeedId);
+    }
+    return normalizeSeedId(CONFIG.targetSeedId);
+}
+
+function applyRuntimeFarmConfig() {
+    const cfg = readWebuiConfig();
+    if (!cfg) return;
+
+    if (Object.prototype.hasOwnProperty.call(cfg, 'intervalSec')) {
+        const currentSec = Math.max(1, Math.floor(CONFIG.farmCheckInterval / 1000));
+        const nextSec = normalizeIntervalSec(cfg.intervalSec, currentSec);
+        const nextMs = nextSec * 1000;
+        if (nextMs !== CONFIG.farmCheckInterval) {
+            CONFIG.farmCheckInterval = nextMs;
+            log('CONFIG', `farm interval hot-updated to ${nextSec}s`);
+        }
+    }
+}
+
+function extractErrorCode(err) {
+    const msg = String((err && err.message) || err || '');
+    const match = msg.match(/code=(\d+)/);
+    return match ? Number(match[1]) : 0;
+}
+
+function shouldIgnoreActionError(actionTag, err) {
+    const code = extractErrorCode(err);
+    const codes = BENIGN_ACTION_ERROR_CODES[actionTag];
+    return Boolean(codes && codes.has(code));
+}
+
+function logActionError(actionTag, err) {
+    if (shouldIgnoreActionError(actionTag, err)) return;
+    logWarn(actionTag, err.message || String(err));
+}
+
 async function findBestSeed(landsCount) {
     const SEED_SHOP_ID = 2;
     const shopReply = await getShopInfo(SEED_SHOP_ID);
@@ -209,14 +292,37 @@ async function findBestSeed(landsCount) {
         return null;
     }
 
+    // 默认按最低等级(大萝卜)优先，支持配置指定作物。
+    available.sort((a, b) => {
+        if (a.requiredLevel !== b.requiredLevel) return a.requiredLevel - b.requiredLevel;
+        if (a.price !== b.price) return a.price - b.price;
+        return a.seedId - b.seedId;
+    });
+
+    const preferredSeedId = getPreferredSeedId();
+    if (preferredSeedId > 0) {
+        const matched = available.find((item) => item.seedId === preferredSeedId);
+        if (matched) {
+            lastSeedFallbackKey = '';
+            return matched;
+        }
+
+        const fallbackKey = `${preferredSeedId}:${available.map((item) => item.seedId).join(',')}`;
+        if (fallbackKey !== lastSeedFallbackKey) {
+            const preferredName = getPlantNameBySeedId(preferredSeedId);
+            logWarn('商店', `指定作物 ${preferredName}(${preferredSeedId}) 当前不可购买，已回退默认作物`);
+            lastSeedFallbackKey = fallbackKey;
+        }
+    } else {
+        lastSeedFallbackKey = '';
+    }
+
     if (CONFIG.forceLowestLevelCrop) {
-        available.sort((a, b) => a.requiredLevel - b.requiredLevel || a.price - b.price);
         return available[0];
     }
 
     try {
         log('商店', `等级: ${state.level}，土地数量: ${landsCount}`);
-        
         const rec = getPlantingRecommendation(state.level, landsCount == null ? 18 : landsCount, { top: 50 });
         const rankedSeedIds = rec.candidatesNormalFert.map(x => x.seedId);
         for (const seedId of rankedSeedIds) {
@@ -227,12 +333,13 @@ async function findBestSeed(landsCount) {
         logWarn('商店', `经验效率推荐失败，使用兜底策略: ${e.message}`);
     }
 
-    // 兜底：等级在28级以前还是白萝卜比较好，28级以上选最高等级的种子
-    if(state.level && state.level <= 28){
-        available.sort((a, b) => a.requiredLevel - b.requiredLevel);
-    }else{
-        available.sort((a, b) => b.requiredLevel - a.requiredLevel);
+    // 兜底：等级在28级以前更偏向低级作物，28级以上偏向高级作物
+    if (state.level && state.level <= 28) {
+        available.sort((a, b) => a.requiredLevel - b.requiredLevel || a.price - b.price);
+    } else {
+        available.sort((a, b) => b.requiredLevel - a.requiredLevel || a.price - b.price);
     }
+
     return available[0];
 }
 
@@ -295,6 +402,7 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds, unlockedLandCount)
             for (const item of buyReply.cost_items) {
                 state.gold -= toNum(item.count);
             }
+            updateStatusGold(state.gold);
         }
         const boughtName = getPlantNameBySeedId(actualSeedId);
         log('购买', `已购买 ${boughtName}种子 x${landsToPlant.length}, 花费 ${bestSeed.price * landsToPlant.length} 金币`);
@@ -484,6 +592,8 @@ async function checkFarm() {
     isCheckingFarm = true;
 
     try {
+        applyRuntimeFarmConfig();
+
         const landsReply = await getAllLands();
         if (!landsReply.lands || landsReply.lands.length === 0) {
             log('农场', '没有土地数据');
@@ -514,13 +624,13 @@ async function checkFarm() {
         // 一键操作：除草、除虫、浇水可以并行执行（游戏中都是一键完成）
         const batchOps = [];
         if (status.needWeed.length > 0) {
-            batchOps.push(weedOut(status.needWeed).then(() => actions.push(`除草${status.needWeed.length}`)).catch(e => logWarn('除草', e.message)));
+            batchOps.push(weedOut(status.needWeed).then(() => actions.push(`除草${status.needWeed.length}`)).catch(e => logActionError('除草', e)));
         }
         if (status.needBug.length > 0) {
-            batchOps.push(insecticide(status.needBug).then(() => actions.push(`除虫${status.needBug.length}`)).catch(e => logWarn('除虫', e.message)));
+            batchOps.push(insecticide(status.needBug).then(() => actions.push(`除虫${status.needBug.length}`)).catch(e => logActionError('除虫', e)));
         }
         if (status.needWater.length > 0) {
-            batchOps.push(waterLand(status.needWater).then(() => actions.push(`浇水${status.needWater.length}`)).catch(e => logWarn('浇水', e.message)));
+            batchOps.push(waterLand(status.needWater).then(() => actions.push(`浇水${status.needWater.length}`)).catch(e => logActionError('浇水', e)));
         }
         if (batchOps.length > 0) {
             await Promise.all(batchOps);
@@ -610,3 +720,4 @@ module.exports = {
     getCurrentPhase,
     setOperationLimitsCallback,
 };
+

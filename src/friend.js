@@ -2,12 +2,18 @@
  * 好友农场操作 - 进入/离开/帮忙/偷菜/巡查
  */
 
+const fs = require('fs');
+const path = require('path');
 const { CONFIG, PlantPhase, PHASE_NAMES } = require('./config');
 const { types } = require('./proto');
 const { sendMsgAsync, getUserState, networkEvents } = require('./network');
 const { toLong, toNum, getServerTimeSec, log, logWarn, sleep } = require('./utils');
 const { getCurrentPhase, setOperationLimitsCallback } = require('./farm');
 const { getPlantName } = require('./gameConfig');
+
+const WEBUI_CONFIG_PATH = path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+let webuiConfigMtimeMs = -1;
+let webuiConfigCache = null;
 
 // ============ 内部状态 ============
 let isCheckingFriends = false;
@@ -628,8 +634,46 @@ async function checkFriends() {
 /**
  * 好友巡查循环 - 本次完成后等待指定秒数再开始下次
  */
+function normalizeIntervalSec(value, fallbackSec) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallbackSec;
+    return Math.min(Math.max(Math.floor(n), 1), 300);
+}
+
+function readWebuiConfig() {
+    try {
+        const stat = fs.statSync(WEBUI_CONFIG_PATH);
+        if (stat.mtimeMs === webuiConfigMtimeMs) return webuiConfigCache;
+
+        const parsed = JSON.parse(fs.readFileSync(WEBUI_CONFIG_PATH, 'utf8')) || {};
+        webuiConfigMtimeMs = stat.mtimeMs;
+        webuiConfigCache = typeof parsed === 'object' && parsed ? parsed : {};
+        return webuiConfigCache;
+    } catch (err) {
+        webuiConfigMtimeMs = -1;
+        webuiConfigCache = null;
+        return null;
+    }
+}
+
+function applyRuntimeFriendConfig() {
+    const cfg = readWebuiConfig();
+    if (!cfg) return;
+
+    if (Object.prototype.hasOwnProperty.call(cfg, 'friendIntervalSec')) {
+        const currentSec = Math.max(1, Math.floor(CONFIG.friendCheckInterval / 1000));
+        const nextSec = normalizeIntervalSec(cfg.friendIntervalSec, currentSec);
+        const nextMs = nextSec * 1000;
+        if (nextMs !== CONFIG.friendCheckInterval) {
+            CONFIG.friendCheckInterval = nextMs;
+            log('CONFIG', `friend interval hot-updated to ${nextSec}s`);
+        }
+    }
+}
+
 async function friendCheckLoop() {
     while (friendLoopRunning) {
+        applyRuntimeFriendConfig();
         await checkFriends();
         if (!friendLoopRunning) break;
         await sleep(CONFIG.friendCheckInterval);
