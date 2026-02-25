@@ -7,7 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const util = require('util');
 
-const LOG_DIR = path.join(process.cwd(), 'logs');
+const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
+const LOG_DIR = _dataDir ? path.join(_dataDir, 'logs') : path.join(process.cwd(), 'logs');
 
 let initialized = false;
 let currentDateKey = '';

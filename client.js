@@ -29,7 +29,8 @@ const { initFileLogger } = require('./src/logger');
 
 initFileLogger();
 
-const LOCK_FILE = path.join(__dirname, '.bot.lock');
+const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
+const LOCK_FILE = _dataDir ? path.join(_dataDir, '.bot.lock') : path.join(__dirname, '.bot.lock');
 let lockAcquired = false;
 let shuttingDown = false;
 

@@ -13,10 +13,18 @@ const { updateStatusGold } = require('./status');
 const { getPlantNameBySeedId, getPlantName, getPlantExp, formatGrowTime, getPlantGrowTime, getItemName } = require('./gameConfig');
 const { getPlantingRecommendation } = require('../tools/calc-exp-yield');
 
-const WEBUI_CONFIG_PATH = path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
+const WEBUI_CONFIG_PATH = _dataDir
+    ? path.join(_dataDir, 'config.json')
+    : path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+const WEBUI_LANDS_PATH = _dataDir
+    ? path.join(_dataDir, 'lands.json')
+    : path.resolve(__dirname, '../../qq-farm-webui/data/lands.json');
 let webuiConfigMtimeMs = -1;
 let webuiConfigCache = null;
 let lastSeedFallbackKey = '';
+let lastWebuiLandsWriteErrorMsg = '';
+let lastWebuiLandsWriteErrorAt = 0;
 
 const BENIGN_ACTION_ERROR_CODES = {
     浇水: new Set([1001012]),
@@ -29,6 +37,8 @@ let isCheckingFarm = false;
 let isFirstFarmCheck = true;
 let farmCheckTimer = null;
 let farmLoopRunning = false;
+let lastFertStatusLogAt = 0;
+const FERT_STATUS_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 每 5 分钟主动上报一次肥料状态
 
 // ============ 农场 API ============
 
@@ -120,13 +130,25 @@ async function getNormalFertilizerCount() {
  */
 async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
     let successCount = 0;
+    let lastFertilizerRemainSec = null;
     for (const landId of landIds) {
         try {
             const body = types.FertilizeRequest.encode(types.FertilizeRequest.create({
                 land_ids: [toLong(landId)],
                 fertilizer_id: toLong(fertilizerId),
             })).finish();
-            await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', body);
+            const { body: replyBody } = await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', body);
+            if (fertilizerId === NORMAL_FERTILIZER_ID && replyBody) {
+                try {
+                    const reply = types.FertilizeReply.decode(replyBody);
+                    const remainSec = toNum(reply.fertilizer);
+                    if (Number.isFinite(remainSec) && remainSec >= 0) {
+                        lastFertilizerRemainSec = remainSec;
+                    }
+                } catch (e) {
+                    // 忽略解码失败，后续走 Bag 查询兜底
+                }
+            }
             successCount++;
         } catch (e) {
             // 施肥失败（可能肥料不足），停止继续
@@ -136,21 +158,52 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
     }
 
     if (fertilizerId === NORMAL_FERTILIZER_ID && landIds.length > 0) {
-        const remaining = await getNormalFertilizerCount();
-        if (Number.isFinite(remaining)) {
-            if (remaining > 0) {
-                log('施肥', `FERT_STATUS normal_count=${remaining}`);
+        if (Number.isFinite(lastFertilizerRemainSec)) {
+            if (lastFertilizerRemainSec > 0) {
+                log('施肥', `FERT_STATUS normal_sec=${lastFertilizerRemainSec}`);
             } else {
-                log('施肥', 'FERT_STATUS low normal_count=0');
+                log('施肥', 'FERT_STATUS low normal_sec=0');
             }
-        } else if (successCount >= landIds.length) {
-            log('施肥', 'FERT_STATUS ok');
+            lastFertStatusLogAt = Date.now();
         } else {
-            log('施肥', 'FERT_STATUS low');
+            const remaining = await getNormalFertilizerCount();
+            if (Number.isFinite(remaining)) {
+                if (remaining > 0) {
+                    log('施肥', `FERT_STATUS normal_count=${remaining}`);
+                } else {
+                    log('施肥', 'FERT_STATUS low normal_count=0');
+                }
+                lastFertStatusLogAt = Date.now();
+            } else if (successCount >= landIds.length) {
+                log('施肥', 'FERT_STATUS ok');
+            } else {
+                log('施肥', 'FERT_STATUS low');
+            }
         }
     }
 
     return successCount;
+}
+
+/**
+ * 主动查询普通化肥余量并上报给 webui（无论是否正在施肥）
+ * 仅当距上次上报超过 FERT_STATUS_CHECK_INTERVAL_MS 时才执行
+ */
+async function reportFertilizerStatusIfStale() {
+    if (Date.now() - lastFertStatusLogAt < FERT_STATUS_CHECK_INTERVAL_MS) return;
+    try {
+        const count = await getNormalFertilizerCount();
+        if (Number.isFinite(count)) {
+            if (count > 0) {
+                log('施肥', `FERT_STATUS normal_count=${count}`);
+            } else {
+                log('施肥', 'FERT_STATUS low normal_count=0');
+            }
+            lastFertStatusLogAt = Date.now();
+        }
+    } catch (e) {
+        // 查询失败不影响主流程
+    }
 }
 
 async function removePlant(landIds) {
@@ -507,6 +560,141 @@ function getCurrentPhase(phases, debug, landLabel) {
     return phases[0];
 }
 
+function clamp01(val) {
+    if (!Number.isFinite(val)) return 0;
+    if (val <= 0) return 0;
+    if (val >= 1) return 1;
+    return val;
+}
+
+function serializePhaseForWebui(phase) {
+    if (!phase) return null;
+    const phaseVal = Number.isFinite(Number(phase.phase)) ? Number(phase.phase) : 0;
+    return {
+        phase: phaseVal,
+        phase_name: PHASE_NAMES[phaseVal] || `阶段${phaseVal}`,
+        begin_time: toTimeSec(phase.begin_time),
+        dry_time: toTimeSec(phase.dry_time),
+        weeds_time: toTimeSec(phase.weeds_time),
+        insect_time: toTimeSec(phase.insect_time),
+    };
+}
+
+function serializePlantForWebui(plant, serverNowSec) {
+    if (!plant) return null;
+    const phases = Array.isArray(plant.phases) ? plant.phases : [];
+    const currentPhase = getCurrentPhase(phases, false, '');
+    const currentPhaseVal = currentPhase ? Number(currentPhase.phase) : 0;
+    const phaseRows = phases.map(serializePhaseForWebui).filter(Boolean);
+
+    let firstPhaseBeginSec = 0;
+    let matureBeginSec = 0;
+    for (const p of phaseRows) {
+        if (p.begin_time > 0 && (firstPhaseBeginSec === 0 || p.begin_time < firstPhaseBeginSec)) {
+            firstPhaseBeginSec = p.begin_time;
+        }
+        if (p.phase === PlantPhase.MATURE && p.begin_time > 0) {
+            matureBeginSec = p.begin_time;
+        }
+    }
+
+    let progressPct = null;
+    if (matureBeginSec > 0 && firstPhaseBeginSec > 0 && matureBeginSec > firstPhaseBeginSec) {
+        progressPct = Math.round(clamp01((serverNowSec - firstPhaseBeginSec) / (matureBeginSec - firstPhaseBeginSec)) * 1000) / 10;
+    } else if (currentPhaseVal === PlantPhase.MATURE) {
+        progressPct = 100;
+    } else if (currentPhaseVal === PlantPhase.DEAD) {
+        progressPct = 100;
+    }
+
+    const matureRemainingSec = matureBeginSec > 0 ? Math.max(0, matureBeginSec - serverNowSec) : null;
+    const currentPhaseRow = serializePhaseForWebui(currentPhase);
+
+    return {
+        id: toNum(plant.id),
+        name: plant.name || '',
+        season: toNum(plant.season),
+        grow_sec: toNum(plant.grow_sec),
+        dry_num: toNum(plant.dry_num),
+        stole_num: toNum(plant.stole_num),
+        fruit_id: toNum(plant.fruit_id),
+        fruit_num: toNum(plant.fruit_num),
+        stealable: Boolean(plant.stealable),
+        left_inorc_fert_times: toNum(plant.left_inorc_fert_times),
+        left_fruit_num: toNum(plant.left_fruit_num),
+        is_nudged: Boolean(plant.is_nudged),
+        current_phase: currentPhaseVal,
+        current_phase_name: PHASE_NAMES[currentPhaseVal] || `阶段${currentPhaseVal}`,
+        current_phase_begin_time: currentPhaseRow ? currentPhaseRow.begin_time : 0,
+        first_phase_begin_time: firstPhaseBeginSec || 0,
+        mature_begin_time: matureBeginSec || 0,
+        mature_remaining_sec: matureRemainingSec,
+        progress_pct: progressPct,
+        phase_count: phaseRows.length,
+        phases: phaseRows,
+    };
+}
+
+function serializeLandForWebui(land, slotIndex, serverNowSec) {
+    if (!land) {
+        return {
+            slot: slotIndex + 1,
+            id: slotIndex + 1,
+            unlocked: false,
+            missing: true,
+        };
+    }
+
+    return {
+        slot: slotIndex + 1,
+        id: toNum(land.id),
+        unlocked: Boolean(land.unlocked),
+        level: toNum(land.level),
+        max_level: toNum(land.max_level),
+        could_unlock: Boolean(land.could_unlock),
+        could_upgrade: Boolean(land.could_upgrade),
+        land_size: toNum(land.land_size),
+        lands_level: toNum(land.lands_level),
+        is_shared: Boolean(land.is_shared),
+        can_share: Boolean(land.can_share),
+        master_land_id: toNum(land.master_land_id),
+        slave_land_ids: Array.isArray(land.slave_land_ids) ? land.slave_land_ids.map(toNum) : [],
+        plant: serializePlantForWebui(land.plant, serverNowSec),
+    };
+}
+
+function writeWebuiLandsSnapshot(lands) {
+    try {
+        const serverNowSec = getServerTimeSec();
+        const capturedAtMs = Date.now();
+        const landRows = (Array.isArray(lands) ? lands : []).map((land, idx) => serializeLandForWebui(land, idx, serverNowSec));
+        const payload = {
+            version: 1,
+            source: 'qq-farm-bot',
+            updated_at: new Date(capturedAtMs).toISOString(),
+            captured_at_ms: capturedAtMs,
+            server_now_sec: serverNowSec,
+            total: landRows.length,
+            unlocked_count: landRows.filter(l => l && l.unlocked).length,
+            lands: landRows,
+        };
+
+        fs.mkdirSync(path.dirname(WEBUI_LANDS_PATH), { recursive: true });
+        const tmpPath = `${WEBUI_LANDS_PATH}.tmp`;
+        fs.writeFileSync(tmpPath, `${JSON.stringify(payload)}\n`, 'utf8');
+        fs.renameSync(tmpPath, WEBUI_LANDS_PATH);
+        lastWebuiLandsWriteErrorMsg = '';
+    } catch (e) {
+        const now = Date.now();
+        const msg = e && e.message ? e.message : String(e);
+        if (msg !== lastWebuiLandsWriteErrorMsg || (now - lastWebuiLandsWriteErrorAt) > 60_000) {
+            logWarn('WEBUI', `写入地块快照失败: ${msg}`);
+            lastWebuiLandsWriteErrorMsg = msg;
+            lastWebuiLandsWriteErrorAt = now;
+        }
+    }
+}
+
 function analyzeLands(lands) {
     const result = {
         harvestable: [], needWater: [], needWeed: [], needBug: [],
@@ -630,6 +818,7 @@ async function checkFarm() {
 
     try {
         applyRuntimeFarmConfig();
+        await reportFertilizerStatusIfStale();
 
         const landsReply = await getAllLands();
         if (!landsReply.lands || landsReply.lands.length === 0) {
@@ -638,6 +827,7 @@ async function checkFarm() {
         }
 
         const lands = landsReply.lands;
+        writeWebuiLandsSnapshot(lands);
         const status = analyzeLands(lands);
         const unlockedLandCount = lands.filter(land => land && land.unlocked).length;
         isFirstFarmCheck = false;

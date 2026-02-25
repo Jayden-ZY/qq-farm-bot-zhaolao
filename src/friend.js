@@ -11,7 +11,10 @@ const { toLong, toNum, getServerTimeSec, log, logWarn, sleep } = require('./util
 const { getCurrentPhase, setOperationLimitsCallback } = require('./farm');
 const { getPlantName } = require('./gameConfig');
 
-const WEBUI_CONFIG_PATH = path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
+const WEBUI_CONFIG_PATH = _dataDir
+    ? path.join(_dataDir, 'config.json')
+    : path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
 let webuiConfigMtimeMs = -1;
 let webuiConfigCache = null;
 
@@ -21,6 +24,9 @@ let isFirstFriendCheck = true;
 let friendCheckTimer = null;
 let friendLoopRunning = false;
 let lastResetDate = '';  // 上次重置日期 (YYYY-MM-DD)
+let friendActiveStart = '';   // webui 配置的生效时段开始 "HH:MM"
+let friendActiveEnd = '';     // webui 配置的生效时段结束 "HH:MM"
+let lastWindowSkipLogAt = 0;  // 上次打"时段外跳过"日志的时间戳（防刷屏）
 
 // 经验追踪：记录帮助前的 dayExpTimes，操作后对比是否增长
 const expTracker = new Map();       // opId -> 帮助前的 dayExpTimes
@@ -632,6 +638,25 @@ async function checkFriends() {
 }
 
 /**
+ * 判断当前时间是否在好友巡查生效时段内
+ * 支持跨午夜（start > end 时，如 22:00-06:00）
+ */
+function isInFriendActiveWindow(start, end) {
+    if (!start || !end) return false;
+    const now = new Date();
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+    const [sh, sm] = start.split(':').map(Number);
+    const [eh, em] = end.split(':').map(Number);
+    const startMin = sh * 60 + sm;
+    const endMin = eh * 60 + em;
+    if (startMin <= endMin) {
+        return nowMin >= startMin && nowMin < endMin;
+    }
+    // 跨午夜：startMin > endMin
+    return nowMin >= startMin || nowMin < endMin;
+}
+
+/**
  * 好友巡查循环 - 本次完成后等待指定秒数再开始下次
  */
 function normalizeIntervalSec(value, fallbackSec) {
@@ -669,11 +694,30 @@ function applyRuntimeFriendConfig() {
             log('CONFIG', `friend interval hot-updated to ${nextSec}s`);
         }
     }
+
+    const normalizeHHMM = (v) => (/^\d{2}:\d{2}$/.test(String(v || '').trim()) ? String(v).trim() : '');
+    friendActiveStart = normalizeHHMM(cfg.friendActiveStart);
+    friendActiveEnd = normalizeHHMM(cfg.friendActiveEnd);
 }
 
 async function friendCheckLoop() {
     while (friendLoopRunning) {
         applyRuntimeFriendConfig();
+
+        if (!isInFriendActiveWindow(friendActiveStart, friendActiveEnd)) {
+            if (Date.now() - lastWindowSkipLogAt >= 10 * 60 * 1000) {
+                const reason = (!friendActiveStart || !friendActiveEnd)
+                    ? '未配置好友巡查时段，跳过本次巡查'
+                    : `当前不在好友巡查时段（${friendActiveStart}–${friendActiveEnd}），跳过本次巡查`;
+                log('好友', reason);
+                lastWindowSkipLogAt = Date.now();
+            }
+            if (!friendLoopRunning) break;
+            await sleep(CONFIG.friendCheckInterval);
+            continue;
+        }
+
+        lastWindowSkipLogAt = 0;
         await checkFriends();
         if (!friendLoopRunning) break;
         await sleep(CONFIG.friendCheckInterval);
