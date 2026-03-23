@@ -13,7 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { CONFIG } = require('./src/config');
+const { CONFIG, setClientVersion } = require('./src/config');
 const { loadProto } = require('./src/proto');
 const { connect, cleanup, getWs } = require('./src/network');
 const { startFarmCheckLoop, stopFarmCheckLoop } = require('./src/farm');
@@ -108,18 +108,20 @@ QQ经典农场 挂机脚本
 ====================
 
 用法:
-  node client.js --code <登录code> [--wx] [--interval <秒>] [--friend-interval <秒>] [--seed-id <ID>]
+  node client.js --code <登录code> [--client-version <版本号>] [--wx] [--interval <秒>] [--friend-interval <秒>] [--seed-id <ID>]
   node client.js --qr [--interval <秒>] [--friend-interval <秒>]
   node client.js --verify
   node client.js --decode <数据> [--hex] [--gate] [--type <消息类型>]
 
 参数:
   --code              小程序 login() 返回的临时凭证
+  --client-version    登录与心跳使用的版本号，例如 1.7.0.6_20260313
   --qr                启动后使用QQ扫码获取登录code（仅QQ平台）
   --wx                使用微信登录 (默认为QQ小程序)
   --interval          自己农场巡查完成后等待秒数
   --friend-interval   好友巡查完成后等待秒数
   --seed-id           指定种子ID，0表示自动策略
+  --login-body-file   使用抓包得到的原始登录 body 文件（hex/base64/原始二进制）
   --allow-multi       允许同目录下多开实例 (默认禁止，避免同号互踢)
   --verify            验证proto定义
   --decode            解码PB数据 (运行 --decode 无参数查看详细帮助)
@@ -130,6 +132,7 @@ QQ经典农场 挂机脚本
 function parseArgs(args) {
     const options = {
         code: '',
+        clientVersion: '',
         qrLogin: false,
         allowMulti: false,
     };
@@ -137,6 +140,9 @@ function parseArgs(args) {
     for (let i = 0; i < args.length; i++) {
         if (args[i] === '--code' && args[i + 1]) {
             options.code = args[++i];
+        }
+        if ((args[i] === '--client-version' || args[i] === '--version') && args[i + 1]) {
+            options.clientVersion = args[++i];
         }
         if (args[i] === '--qr') {
             options.qrLogin = true;
@@ -149,17 +155,20 @@ function parseArgs(args) {
         }
         if (args[i] === '--interval' && args[i + 1]) {
             const sec = parseInt(args[++i], 10);
-            CONFIG.farmCheckInterval = Math.max(sec, 1) * 1000;
+            CONFIG.farmCheckInterval = Math.max(sec, 0) * 1000;
         }
         if (args[i] === '--friend-interval' && args[i + 1]) {
             const sec = parseInt(args[++i], 10);
-            CONFIG.friendCheckInterval = Math.max(sec, 1) * 1000;
+            CONFIG.friendCheckInterval = Math.max(sec, 0) * 1000;
         }
         if (args[i] === '--seed-id' && args[i + 1]) {
             const seedId = parseInt(args[++i], 10);
             if (Number.isInteger(seedId) && seedId >= 0) {
                 CONFIG.targetSeedId = seedId;
             }
+        }
+        if (args[i] === '--login-body-file' && args[i + 1]) {
+            CONFIG.loginBodyFile = args[++i];
         }
     }
 
@@ -188,6 +197,9 @@ async function main() {
 
     // 正常挂机模式
     const options = parseArgs(args);
+    if (options.clientVersion) {
+        setClientVersion(options.clientVersion);
+    }
 
     // QQ 平台支持扫码登录: 显式 --qr，或未传 --code 时自动触发
     if (!options.code && CONFIG.platform === 'qq' && (options.qrLogin || !args.includes('--code'))) {
@@ -221,7 +233,7 @@ async function main() {
     emitRuntimeHint(true);
 
     const platformName = CONFIG.platform === 'wx' ? '微信' : 'QQ';
-    console.log(`[启动] ${platformName} code=${options.code.substring(0, 8)}... 农场${CONFIG.farmCheckInterval / 1000}s 好友${CONFIG.friendCheckInterval / 1000}s`);
+    console.log(`[启动] ${platformName} code=${options.code.substring(0, 8)}... ver=${CONFIG.clientVersion} 农场${CONFIG.farmCheckInterval / 1000}s 好友${CONFIG.friendCheckInterval / 1000}s`);
 
     // 连接并登录，登录成功后启动各功能模块
     connect(options.code, async () => {

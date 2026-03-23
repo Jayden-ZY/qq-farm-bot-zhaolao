@@ -91,6 +91,13 @@ message AcceptFriendsReply {
     repeated GameFriend friends = 1;
 }
 
+// --- 删除好友 ---
+message DelFriendRequest {
+    int64 friend_gid = 1;
+}
+
+message DelFriendReply {}
+
 // --- 拒绝好友申请 ---
 message RejectFriendsRequest {
     repeated int64 friend_gids = 1;

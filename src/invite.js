@@ -83,7 +83,7 @@ async function sendReportArkClick(sharerId, sharerOpenId, shareSource) {
         sharer_id: toLong(sharerId),
         sharer_open_id: sharerOpenId,
         share_cfg_id: toLong(shareSource || 0),
-        scene_id: '1256',  // 模拟微信场景
+        scene_id: CONFIG.loginSceneId,  // 与登录场景保持一致
     })).finish();
     
     const { body: replyBody } = await sendMsgAsync('gamepb.userpb.UserService', 'ReportArkClick', body);

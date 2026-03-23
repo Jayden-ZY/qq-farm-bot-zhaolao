@@ -1,0 +1,775 @@
+﻿<!doctype html>
+<html lang="zh-CN" data-theme="blue">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QQ 农场挂机控制台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;800&family=Noto+Serif+SC:wght@600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+    <div class="bg-shape bg-shape-1" aria-hidden="true"></div>
+    <div class="bg-shape bg-shape-2" aria-hidden="true"></div>
+
+    <div class="app app-shell">
+        <header class="topdock card">
+            <div class="topdock-head">
+                <div class="topdock-brand">
+                    <p class="eyebrow">Farm Operation Deck</p>
+                    <h1>QQ 农场挂机控制台</h1>
+                </div>
+
+                <div class="topdock-account">
+                    <div class="user-bar-stats">
+                        <span class="user-stat-chip">当前登录人数：<strong id="statLoggedIn">-</strong></span>
+                        <span class="user-stat-chip user-stat-running">托管人数：<strong id="statRunning">-</strong></span>
+                    </div>
+                    <div class="topdock-account-row">
+                        <span class="user-bar-name">👤 <span id="userBarName">...</span></span>
+                        <button class="user-bar-logout" id="btnLogout" onclick="handleLogout()">退出登录</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="topdock-main">
+                <section class="topdock-runtime">
+                    <div class="topdock-runtime-head">
+                        <span id="statusBadge" class="status-badge offline">离线</span>
+                        <span id="runtimeText" class="pill">未运行</span>
+                        <span id="logAliveBadge" class="log-alive-badge idle" title="后台连接状态：检查中" aria-label="后台连接状态"></span>
+                    </div>
+                    <div class="topdock-runtime-actions">
+                        <button id="btnToggle" class="btn btn-primary btn-toggle">启动</button>
+                        <label class="runtime-mode" for="performanceMode">
+                            <span>运行模式</span>
+                            <select id="performanceMode" name="performanceMode">
+                                <option value="standard">中规中矩</option>
+                                <option value="retire">休养生息</option>
+                                <option value="berserk">不当人喽</option>
+                            </select>
+                        </label>
+                    </div>
+                    <p id="actionHint" class="hint">等待连接...</p>
+                </section>
+
+                <section class="topdock-code code-field" aria-labelledby="topCodeTitle">
+                    <div class="code-field-head">
+                        <strong id="topCodeTitle">登录 code</strong>
+                        <button id="btnCodePrompt" type="button" class="btn btn-ghost btn-compact">更新 code</button>
+                    </div>
+                    <button id="codeStatusChip" type="button" class="code-status-chip is-empty" aria-label="code 状态">
+                        <span id="codeStatusDot" class="code-status-dot" aria-hidden="true"></span>
+                        <span class="code-status-copy">
+                            <strong id="codeStatusText">未填写</strong>
+                            <small id="codeStatusMeta">点击“更新 code”后自动保存</small>
+                        </span>
+                    </button>
+                    <input id="code" name="code" type="hidden" value="" />
+                    <input id="clientVersion" name="clientVersion" type="hidden" value="" />
+                    <small class="field-note">绿色=运行中生效；蓝色=已就绪未使用；红色=失效/被顶号。过期时可直接点击状态更新。</small>
+                </section>
+            </div>
+        </header>
+
+        <nav id="mainTabs" class="main-tabs" aria-label="主功能标签">
+            <button type="button" class="main-tab is-active" data-tab-target="overview" aria-selected="true">运行概览</button>
+            <button type="button" class="main-tab" data-tab-target="stats" aria-selected="false">收益统计</button>
+            <button type="button" class="main-tab" data-tab-target="friends" aria-selected="false">好友价值</button>
+            <button type="button" class="main-tab" data-tab-target="logs" aria-selected="false">实时日志</button>
+            <button type="button" class="main-tab" data-tab-target="settings" aria-selected="false">系统设置</button>
+        </nav>
+
+        <main class="tab-stack">
+            <section class="tab-panel is-active" data-tab-panel="overview">
+                <section class="card section metrics panel-metrics" aria-labelledby="metricsTitle">
+                    <div class="section-head">
+                        <h2 id="metricsTitle">运行概览</h2>
+                        <span class="pill">实时指标</span>
+                    </div>
+                    <div class="metric-grid">
+                        <article class="metric-item metric-item-hidden" aria-hidden="true">
+                            <p class="metric-label">进程 PID</p>
+                            <p id="metricPid" class="metric-value">-</p>
+                        </article>
+                        <article class="metric-item">
+                            <p class="metric-label">运行时长</p>
+                            <p id="metricUptime" class="metric-value">00:00:00</p>
+                        </article>
+                        <article class="metric-item">
+                            <p class="metric-label">等级</p>
+                            <p id="metricLevel" class="metric-value">-</p>
+                        </article>
+                        <article class="metric-item">
+                            <p class="metric-label">金币</p>
+                            <p id="metricGold" class="metric-value">-</p>
+                        </article>
+                        <article class="metric-item">
+                            <div class="metric-label-row">
+                                <p class="metric-label">点券</p>
+                                <span id="metricDiamondPending" class="metric-pending" hidden title="点券刷新中" aria-label="点券刷新中"></span>
+                            </div>
+                            <p id="metricDiamond" class="metric-value">-</p>
+                        </article>
+                        <article class="metric-item metric-item-fertilizer">
+                            <div class="metric-label-row metric-fertilizer-head">
+                                <p class="metric-label">普通化肥</p>
+                                <span class="metric-fertilizer-price">10小时 / 34点券</span>
+                            </div>
+                            <div class="metric-fertilizer-main">
+                                <p id="metricFertilizer" class="metric-value metric-fertilizer">-</p>
+                                <button id="btnOverviewBuy10h" type="button" class="metric-fertilizer-buy" title="购买10小时化肥" aria-label="购买10小时化肥" disabled>
+                                    <span class="metric-fertilizer-buy-icon" aria-hidden="true">+</span>
+                                    <span>购买化肥</span>
+                                </button>
+                            </div>
+                        </article>
+                        <article class="metric-item metric-item-exp">
+                            <p class="metric-label">经验进度</p>
+                            <p id="metricExp" class="metric-value metric-value-compact">-</p>
+                            <div class="exp-progress" aria-hidden="true">
+                                <div id="expProgressFill" class="exp-progress-fill"></div>
+                            </div>
+                            <p id="expProgressText" class="metric-subtext">--</p>
+                            <p id="expEtaText" class="metric-subtext metric-eta">预计升级时间：--</p>
+                        </article>
+                    </div>
+
+                </section>
+
+                <section class="card section panel-overview-strategy" aria-labelledby="overviewStrategyTitle">
+                    <div class="section-head">
+                        <h2 id="overviewStrategyTitle">种植策略与 FarmCalc</h2>
+                        <span id="farmCalcLevelHint" class="pill">等级 --</span>
+                    </div>
+                    <div class="overview-strategy-grid">
+                        <label class="field plant-field overview-plant-target">
+                            <span>种植目标</span>
+                            <select id="preferredSeedId" name="preferredSeedId">
+                                <option value="0">自动选择（默认大萝卜）</option>
+                            </select>
+                            <small class="field-note">运行中修改后，下一轮买种和种植会自动生效。</small>
+                        </label>
+
+                        <section class="overview-farmcalc-wrap">
+                            <div id="farmCalcPanel" class="farmcalc-panel" aria-live="polite">
+                                <div class="farmcalc-control-grid">
+                                    <div class="button-row">
+                                        <button id="btnFarmCalcRefresh" type="button" class="btn btn-secondary">刷新推荐</button>
+                                        <button id="btnFarmCalcApplyBest" type="button" class="btn btn-ghost">应用普通肥最优</button>
+                                    </div>
+                                </div>
+                                <p id="farmCalcInputHint" class="farmcalc-note">按固定 24 地块计算推荐。</p>
+                                <p id="farmCalcStatus" class="farmcalc-status">等待计算...</p>
+
+                                <div class="farmcalc-result-grid">
+                                    <article class="farmcalc-result-card">
+                                        <p class="farmcalc-label">不施肥最优</p>
+                                        <p id="farmCalcNoFertName" class="farmcalc-name">-</p>
+                                        <p id="farmCalcNoFertExp" class="farmcalc-exp">-</p>
+                                    </article>
+                                    <article class="farmcalc-result-card">
+                                        <p class="farmcalc-label">普通肥最优</p>
+                                        <p id="farmCalcFertName" class="farmcalc-name">-</p>
+                                        <p id="farmCalcFertExp" class="farmcalc-exp">-</p>
+                                    </article>
+                                </div>
+
+                                <div class="farmcalc-top-wrap">
+                                    <p class="farmcalc-top-title">普通肥推荐 Top 5</p>
+                                    <div id="farmCalcTopList" class="farmcalc-top-list"></div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </section>
+
+                <section class="card section lands panel-lands" aria-labelledby="landsTitle">
+                    <div class="section-head lands-head">
+                        <div class="lands-head-copy">
+                            <h2 id="landsTitle">土地信息</h2>
+                            <p id="landsHint" class="section-subtle">显示 24 块土地状态、土地类型颜色与成熟倒计时。</p>
+                        </div>
+                        <div class="lands-head-actions">
+                            <div class="lands-action-group">
+                                <button id="btnLandsUpgradeAll" type="button" class="btn btn-ghost btn-compact" title="尝试对所有地块执行一次升级接口（单步升级）" disabled>尝试升级全部</button>
+                                <button id="btnBagUseAll" type="button" class="btn btn-ghost btn-compact" title="打开仓库弹窗" disabled>打开仓库</button>
+                            </div>
+                            <span id="landsMeta" class="pill">等待快照</span>
+                        </div>
+                    </div>
+                    <div id="landsGrid" class="lands-grid" aria-live="polite"></div>
+                </section>
+            </section>
+
+            <section class="tab-panel" data-tab-panel="stats" hidden>
+                <section class="card section stats-runtime-panel" aria-labelledby="statsRuntimeTitle">
+                    <div class="section-head">
+                        <div>
+                            <h2 id="statsRuntimeTitle">本次运行汇总</h2>
+                            <p class="section-subtle">当前 bot 进程累计的核心动作计数。</p>
+                        </div>
+                        <span class="pill">运行内统计</span>
+                    </div>
+                    <div class="summary-row summary-row-runtime">
+                        <div class="summary-chip">收获 <strong id="sumHarvest">0</strong></div>
+                        <div class="summary-chip">偷菜 <strong id="sumSteal">0</strong></div>
+                        <div class="summary-chip">任务领取(本次) <strong id="sumTask">0</strong></div>
+                        <div class="summary-chip">出售果实 <strong id="sumSell">0</strong></div>
+                    </div>
+                </section>
+
+                <section class="card section overview-stats-panel stats-page-panel" aria-labelledby="overviewStatsTitle">
+                    <div class="section-head overview-stats-head">
+                        <div class="overview-stats-copy">
+                            <h2 id="overviewStatsTitle">收益统计</h2>
+                            <p id="overviewStatsHint" class="section-subtle">按当前账号日志聚合近 24 小时收益趋势与最近 7 天汇总。</p>
+                        </div>
+                        <span id="overviewStatsUpdated" class="pill">等待统计</span>
+                    </div>
+
+                    <div class="overview-stats-summary" id="overviewStatsSummary">
+                        <article class="overview-stats-kpi">
+                            <p class="overview-stats-kpi-label">24h 出售收益</p>
+                            <p id="statsSale24h" class="overview-stats-kpi-value">-</p>
+                        </article>
+                        <article class="overview-stats-kpi">
+                            <p class="overview-stats-kpi-label">24h 偷菜估值</p>
+                            <p id="statsSteal24h" class="overview-stats-kpi-value">-</p>
+                        </article>
+                        <article class="overview-stats-kpi">
+                            <p class="overview-stats-kpi-label">24h 收获次数</p>
+                            <p id="statsHarvest24h" class="overview-stats-kpi-value">-</p>
+                        </article>
+                        <article class="overview-stats-kpi">
+                            <p class="overview-stats-kpi-label">24h 偷菜次数</p>
+                            <p id="statsStealCount24h" class="overview-stats-kpi-value">-</p>
+                        </article>
+                    </div>
+
+                    <div class="overview-stats-grid">
+                        <article class="overview-chart-card">
+                            <div class="overview-card-head">
+                                <div>
+                                    <h3>收益趋势图</h3>
+                                    <p>近 24 小时 · 出售收益 / 偷菜估值</p>
+                                </div>
+                            </div>
+                            <div id="overviewTrendChart" class="overview-trend-chart" aria-live="polite"></div>
+                        </article>
+
+                        <article class="overview-daily-card">
+                            <div class="overview-card-head">
+                                <div>
+                                    <h3>每日数据汇总</h3>
+                                    <p>最近 7 天</p>
+                                </div>
+                            </div>
+                            <div id="overviewDailyList" class="overview-daily-list" aria-live="polite"></div>
+                        </article>
+                    </div>
+                </section>
+            </section>
+
+            <section class="tab-panel" data-tab-panel="friends" hidden>
+                <section class="card section friends panel-friends" aria-labelledby="friendsTitle">
+                    <div class="section-head friends-head">
+                        <div class="friends-title-wrap">
+                            <h2 id="friendsTitle">好友价值分析</h2>
+                            <p id="friendsHint" class="section-subtle">基于近期日志估算偷菜价值，帮助你识别高收益好友。</p>
+                        </div>
+                        <div class="friends-tools">
+                            <label class="friends-tool">
+                                <span>排序方式</span>
+                                <select id="friendsSortKey">
+                                    <option value="value">估算价值</option>
+                                    <option value="steal">偷菜次数</option>
+                                    <option value="success">最近偷到时间</option>
+                                    <option value="fail">失败次数</option>
+                                    <option value="level">等级</option>
+                                    <option value="name">好友名称</option>
+                                </select>
+                            </label>
+                            <label class="friends-tool">
+                                <span>排序顺序</span>
+                                <select id="friendsSortOrder">
+                                    <option value="desc">倒序</option>
+                                    <option value="asc">正序</option>
+                                </select>
+                            </label>
+                            <label class="friends-tool friends-tool-search">
+                                <span>好友名检索</span>
+                                <input id="friendsNameSearch" type="search" placeholder="模糊搜索好友名" />
+                            </label>
+                            <label class="friends-check">
+                                <input id="friendsOnlyFailed" type="checkbox" />
+                                <span>只看失败</span>
+                            </label>
+                            <label class="friends-check">
+                                <input id="friendsOnlyEffective" type="checkbox" />
+                                <span>只看有效（偷菜 &gt; 0）</span>
+                            </label>
+                            <button id="btnFriendsRefresh" type="button" class="btn btn-ghost btn-compact">刷新统计</button>
+                        </div>
+                    </div>
+
+                    <div class="friends-overview-grid">
+                        <article class="friends-overview-card">
+                            <p class="metric-label">好友数量</p>
+                            <p id="friendsTotalCount" class="metric-value">-</p>
+                        </article>
+                        <article class="friends-overview-card">
+                            <p class="metric-label">偷菜总量（累计）</p>
+                            <p id="friendsTotalStealCount" class="metric-value">-</p>
+                        </article>
+                        <article class="friends-overview-card">
+                            <p class="metric-label">估算总价值</p>
+                            <p id="friendsTotalValue" class="metric-value">-</p>
+                        </article>
+                        <article class="friends-overview-card">
+                            <p class="metric-label">低/无收益好友</p>
+                            <p id="friendsLowValueCount" class="metric-value">-</p>
+                        </article>
+                    </div>
+
+                    <div class="friends-list-wrap">
+                        <div class="friends-list-head" aria-hidden="true">
+                            <span>好友</span>
+                            <span>偷菜</span>
+                            <span>估算价值</span>
+                            <span>失败</span>
+                            <span>最近偷到</span>
+                            <span>操作</span>
+                        </div>
+                        <div id="friendsList" class="friends-list" aria-live="polite"></div>
+                        <div class="friends-pager">
+                            <button id="btnFriendsPrev" type="button" class="btn btn-ghost btn-compact">上一页</button>
+                            <span id="friendsPageInfo" class="friends-page-info">第 1 / 1 页 · 0 条</span>
+                            <button id="btnFriendsNext" type="button" class="btn btn-ghost btn-compact">下一页</button>
+                        </div>
+                    </div>
+                </section>
+            </section>
+
+            <section class="tab-panel" data-tab-panel="logs" hidden>
+                <section class="card section logs panel-logs" aria-labelledby="logsTitle">
+                    <div class="section-head logs-head">
+                        <div class="logs-title-wrap">
+                            <h2 id="logsTitle">实时日志</h2>
+                            <span class="pill">按标签过滤</span>
+                        </div>
+                        <div class="logs-tools">
+                            <input id="logSearch" type="search" placeholder="搜索日志关键字" />
+                            <label class="auto-scroll"><input id="autoScroll" type="checkbox" checked /> 自动滚动</label>
+                        </div>
+                    </div>
+                    <div class="filter-row" id="filterRow">
+                        <button class="filter-chip active" data-tag="ALL">全部</button>
+                        <button class="filter-chip" data-tag="ERROR">错误</button>
+                    </div>
+                    <div id="logList" class="log-list" role="log" aria-live="polite"></div>
+                </section>
+            </section>
+
+            <section class="tab-panel" data-tab-panel="settings" hidden>
+                <div class="settings-grid">
+                    <section class="card section panel-config" aria-labelledby="configTitle">
+                        <div class="section-head">
+                            <h2 id="configTitle">系统设置</h2>
+                            <span class="pill">运行中热更新</span>
+                        </div>
+
+                        <form id="configForm" class="form-grid settings-form">
+                            <label class="field field-hidden">
+                                <span>平台</span>
+                                <select id="platform" name="platform">
+                                    <option value="wx">微信</option>
+                                    <option value="qq">QQ</option>
+                                </select>
+                            </label>
+
+                            <section class="setting-block setting-block-schedule field-wide" aria-labelledby="settingScheduleTitle">
+                                <div class="setting-block-head">
+                                    <h3 id="settingScheduleTitle">巡查节奏</h3>
+                                    <span class="setting-chip">频率控制</span>
+                                </div>
+                                <p class="setting-block-note">控制农场轮询与好友巡查速度。</p>
+                                <div class="setting-schedule-grid">
+                                    <label class="field slider-field setting-mini">
+                                        <div class="slider-title-row">
+                                            <span>农场巡查间隔</span>
+                                            <output id="intervalSecDisplay" class="slider-badge">1s</output>
+                                        </div>
+                                        <input id="intervalSecRange" name="intervalSecRange" type="range" min="0" max="300" step="1" value="1" />
+                                        <div class="slider-input-row">
+                                            <input id="intervalSec" name="intervalSec" type="number" min="0" max="300" />
+                                            <span class="unit-label">秒</span>
+                                        </div>
+                                    </label>
+
+                                    <label class="field slider-field setting-mini">
+                                        <div class="slider-title-row">
+                                            <span>好友巡查间隔</span>
+                                            <output id="friendIntervalSecDisplay" class="slider-badge">1s</output>
+                                        </div>
+                                        <input id="friendIntervalSecRange" name="friendIntervalSecRange" type="range" min="0" max="300" step="1" value="1" />
+                                        <div class="slider-input-row">
+                                            <input id="friendIntervalSec" name="friendIntervalSec" type="number" min="0" max="300" />
+                                            <span class="unit-label">秒</span>
+                                        </div>
+                                    </label>
+                                </div>
+                                <div class="setting-schedule-foot">
+                                    <label class="switch-inline">
+                                        <input id="fastHarvest" name="fastHarvest" type="checkbox" checked />
+                                        <span>秒收自己作物</span>
+                                    </label>
+                                    <label class="switch-inline">
+                                        <input id="autoFertilize" name="autoFertilize" type="checkbox" checked />
+                                        <span>自动施肥</span>
+                                    </label>
+                                    <p class="field-note">距离成熟 60 秒内会预设抢收任务，默认提前 200ms 发起收获请求。普通化肥不足时会自动关闭“自动施肥”。</p>
+                                </div>
+                            </section>
+
+                            <section class="setting-block setting-block-friend field-wide" aria-labelledby="settingFriendTitle">
+                                <div class="setting-block-head">
+                                    <h3 id="settingFriendTitle">好友策略</h3>
+                                    <span class="setting-chip">行为规则</span>
+                                </div>
+                                <p class="setting-block-note">定义好友巡查做什么、在什么时候做、偷菜等级阈值是多少。</p>
+                                <div class="setting-friend-grid">
+                                    <div class="field field-wide friend-actions-field">
+                                        <div class="field-inline-head">
+                                            <span>好友巡查动作</span>
+                                            <small>共 3 项，可热更新</small>
+                                        </div>
+                                        <div class="friend-action-grid">
+                                            <label class="switch-chip"><input id="friendActionSteal" type="checkbox" checked /><span>偷菜</span></label>
+                                            <label class="switch-chip"><input id="friendActionCare" type="checkbox" checked /><span>照顾</span></label>
+                                            <label class="switch-chip"><input id="friendActionPrank" type="checkbox" /><span>捣乱</span></label>
+                                        </div>
+                                        <div class="friend-threshold-row">
+                                            <div class="slider-title-row">
+                                                <label for="stealLevelThresholdRange">偷菜等级阈值（只偷高于该值）</label>
+                                                <output id="stealLevelThresholdDisplay" class="slider-badge">Lv0</output>
+                                            </div>
+                                            <input id="stealLevelThresholdRange" type="range" min="0" max="999" step="1" value="0" />
+                                            <div class="slider-input-row">
+                                                <input id="stealLevelThreshold" type="number" min="0" max="999" step="1" value="0" />
+                                                <span class="unit-label">级</span>
+                                            </div>
+                                        </div>
+                                        <p class="field-note">“照顾”包含浇水 / 除草 / 除虫；“捣乱”包含放草 / 放虫（默认关闭）。</p>
+                                    </div>
+
+                                    <div class="field field-wide friend-active-field">
+                                        <div class="field-inline-head">
+                                            <span>好友巡查生效时段</span>
+                                            <div class="friend-active-tools">
+                                                <label class="switch-inline switch-inline-compact">
+                                                    <input id="friendActiveAllDay" name="friendActiveAllDay" type="checkbox" />
+                                                    <span>全天巡查</span>
+                                                </label>
+                                                <button id="btnFriendActiveClear" type="button" class="btn btn-ghost btn-compact">清空</button>
+                                            </div>
+                                        </div>
+                                        <div class="friend-active-time-row">
+                                            <input id="friendActiveStart" name="friendActiveStart" type="time" />
+                                            <span class="unit-label">至</span>
+                                            <input id="friendActiveEnd" name="friendActiveEnd" type="time" />
+                                        </div>
+                                        <p class="field-note">留空则完全不执行好友巡查。支持跨午夜，如 22:00 至 06:00。</p>
+                                    </div>
+
+                                    <div class="field field-wide friend-apply-field">
+                                        <div class="field-inline-head">
+                                            <span>自动同意申请时段</span>
+                                            <div class="friend-active-tools">
+                                                <label class="switch-inline switch-inline-compact">
+                                                    <input id="friendApplyAllDay" name="friendApplyAllDay" type="checkbox" />
+                                                    <span>全天同意</span>
+                                                </label>
+                                                <button id="btnFriendApplyClear" type="button" class="btn btn-ghost btn-compact">清空</button>
+                                            </div>
+                                        </div>
+                                        <div class="friend-active-time-row">
+                                            <input id="friendApplyActiveStart" name="friendApplyActiveStart" type="time" />
+                                            <span class="unit-label">至</span>
+                                            <input id="friendApplyActiveEnd" name="friendApplyActiveEnd" type="time" />
+                                        </div>
+                                        <p class="field-note">只在该时段执行自动同意，其他时间会排队等待后统一处理。支持跨午夜。</p>
+                                    </div>
+
+                                    <div class="field field-wide friend-auto-delete-field">
+                                        <div class="field-inline-head">
+                                            <span>连续偷不到自动删</span>
+                                            <small>默认关闭</small>
+                                        </div>
+                                        <div class="friend-auto-delete-row">
+                                            <label class="switch-inline switch-inline-compact">
+                                                <input id="friendAutoDeleteNoStealEnabled" type="checkbox" />
+                                                <span>启用自动删除</span>
+                                            </label>
+                                            <label class="field friend-auto-delete-days">
+                                                <span>连续天数</span>
+                                                <input id="friendAutoDeleteNoStealDays" type="number" min="1" max="3650" step="1" value="7" />
+                                            </label>
+                                        </div>
+                                        <p class="field-note">按“最近一次成功偷到时间”计算；从未成功偷到的好友按首次纳入统计时间计算。只对偷菜开关为开的好友生效。</p>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section class="setting-block setting-block-notify field-wide" aria-labelledby="settingNotifyTitle">
+                                <div class="setting-block-head">
+                                    <h3 id="settingNotifyTitle">通知模块</h3>
+                                    <span class="setting-chip">掉线 / 汇报</span>
+                                </div>
+                                <p class="setting-block-note">当前账号独立配置通知渠道。SMTP、接收邮箱、Server酱、掉线提醒和定时汇报都按当前账号分别保存。</p>
+                                <div class="setting-notify-grid">
+                                    <div class="field field-wide notify-channel-field">
+                                        <div class="field-inline-head">
+                                            <span>当前账号通知渠道配置</span>
+                                            <small>支持 QQ、163、企业邮箱等任意 SMTP 服务</small>
+                                        </div>
+                                        <div class="notify-channel-grid">
+                                            <div class="field notify-inline-card">
+                                                <div class="field-inline-head">
+                                                    <span>邮件通知</span>
+                                                    <label class="switch-inline switch-inline-compact">
+                                                        <input id="notifyEmailEnabled" type="checkbox" />
+                                                        <span>启用</span>
+                                                    </label>
+                                                </div>
+                                                <div class="notify-inline-row">
+                                                    <label class="field notify-inline-input">
+                                                        <span>SMTP 主机</span>
+                                                        <input id="notifySmtpHost" type="text" placeholder="例如 smtp.163.com" />
+                                                    </label>
+                                                    <label class="field notify-inline-select">
+                                                        <span>端口</span>
+                                                        <input id="notifySmtpPort" type="number" min="1" max="65535" placeholder="465" />
+                                                    </label>
+                                                </div>
+                                                <div class="notify-inline-row">
+                                                    <label class="field notify-inline-input">
+                                                        <span>SMTP 账号</span>
+                                                        <input id="notifySmtpUser" type="text" placeholder="发件邮箱账号" />
+                                                    </label>
+                                                    <label class="field notify-inline-input">
+                                                        <span>SMTP 授权码</span>
+                                                        <input id="notifySmtpPass" type="password" placeholder="客户端授权码 / SMTP 密码" />
+                                                    </label>
+                                                </div>
+                                                <div class="notify-inline-row">
+                                                    <label class="field notify-inline-input">
+                                                        <span>发件人名称</span>
+                                                        <input id="notifySmtpFromName" type="text" placeholder="QQ Farm Bot" />
+                                                    </label>
+                                                    <label class="field notify-inline-input">
+                                                        <span>接收邮箱</span>
+                                                        <input id="notifyMailTo" type="email" placeholder="例如 123@qq.com" />
+                                                    </label>
+                                                </div>
+                                                <p class="field-note">邮件通知不再依赖环境变量，当前账号手动填写 SMTP 即可。</p>
+                                            </div>
+
+                                            <div class="field notify-inline-card">
+                                                <div class="field-inline-head">
+                                                    <span>Server酱</span>
+                                                    <label class="switch-inline switch-inline-compact">
+                                                        <input id="notifyServerChanEnabled" type="checkbox" />
+                                                        <span>启用</span>
+                                                    </label>
+                                                </div>
+                                                <div class="notify-inline-row">
+                                                    <label class="field notify-inline-select">
+                                                        <span>类型</span>
+                                                        <select id="notifyServerChanType">
+                                                            <option value="sc3">Server酱 3</option>
+                                                            <option value="turbo">Turbo</option>
+                                                        </select>
+                                                    </label>
+                                                    <label class="field notify-inline-input">
+                                                        <span>SendKey</span>
+                                                        <input id="notifyServerChanKey" type="text" placeholder="SCTxxxxxxxx / sctp..." />
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div class="field field-wide notify-disconnect-field">
+                                        <div class="field-inline-head">
+                                            <span>掉线提醒通知</span>
+                                            <small>仅 bot 异常退出时触发，手动停止不提醒</small>
+                                        </div>
+                                        <div class="notify-toggle-grid">
+                                            <label class="switch-chip"><input id="disconnectNotifyEmailEnabled" type="checkbox" /><span>邮件提醒</span></label>
+                                            <label class="switch-chip"><input id="disconnectNotifyServerChanEnabled" type="checkbox" /><span>Server酱提醒</span></label>
+                                        </div>
+                                        <div class="button-row notify-button-row">
+                                            <button id="btnSaveNotificationSettings" type="button" class="btn btn-secondary">保存通知设置</button>
+                                            <button id="btnTestDisconnectNotification" type="button" class="btn btn-ghost">测试掉线提醒</button>
+                                        </div>
+                                    </div>
+
+                                    <div class="field field-wide notify-report-field">
+                                        <div class="field-inline-head">
+                                            <span>定时汇报通知</span>
+                                            <small>按当前账号发送。小时汇报整点触发；每日汇报默认 08:00 触发。</small>
+                                        </div>
+                                        <div class="notify-report-grid">
+                                            <label class="switch-chip"><input id="reportHourlyEnabled" type="checkbox" /><span>每小时汇报</span></label>
+                                            <label class="switch-chip"><input id="reportDailyEnabled" type="checkbox" /><span>每日汇报</span></label>
+                                            <label class="switch-chip"><input id="reportNotifyEmailEnabled" type="checkbox" /><span>邮件推送</span></label>
+                                            <label class="switch-chip"><input id="reportNotifyServerChanEnabled" type="checkbox" /><span>Server酱推送</span></label>
+                                        </div>
+                                        <div class="button-row notify-button-row">
+                                            <button id="btnTestHourlyReport" type="button" class="btn btn-ghost">测试小时汇报</button>
+                                            <button id="btnTestDailyReport" type="button" class="btn btn-ghost">测试每日汇报</button>
+                                        </div>
+                                        <p class="field-note">汇报内容只统计当前账号：出售收益、偷菜估值、收获次数、偷菜次数、当前等级/金币/点券与最近错误。</p>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <label class="field field-wide field-hidden">
+                                <span>额外参数（可选）</span>
+                                <input id="extraArgs" name="extraArgs" type="text" placeholder="例如: --allow-multi" />
+                            </label>
+
+                            <label class="field switch-field field-wide field-hidden">
+                                <input id="allowMulti" name="allowMulti" type="checkbox" />
+                                <span>允许同目录多开（默认关闭）</span>
+                            </label>
+                        </form>
+                    </section>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="codeModal" class="modal-shell" hidden aria-hidden="true">
+        <div id="codeModalBackdrop" class="modal-backdrop"></div>
+        <div class="modal-panel modal-code" role="dialog" aria-modal="true" aria-labelledby="codeModalTitle">
+            <div class="modal-head">
+                <p class="modal-eyebrow">One-Time Login Code</p>
+                <h3 id="codeModalTitle">更新登录 code</h3>
+                <button id="btnCodeModalClose" type="button" class="modal-close" aria-label="关闭弹窗">×</button>
+            </div>
+            <p class="modal-copy">请输入新的登录 code 和版本号。保存后会自动更新为“已就绪”，下次启动时使用。</p>
+            <label class="modal-input-wrap" for="codeModalInput">
+                <span>新 code</span>
+                <input id="codeModalInput" type="text" autocomplete="off" placeholder="粘贴最新 code" />
+            </label>
+            <label class="modal-input-wrap" for="codeModalVersionInput">
+                <span>版本号</span>
+                <input id="codeModalVersionInput" type="text" autocomplete="off" list="clientVersionHistoryList" placeholder="例如 1.7.0.5_20260306" />
+            </label>
+            <datalist id="clientVersionHistoryList"></datalist>
+            <p class="modal-subtle">保存过的版本号会自动记录，可直接下拉选择。</p>
+            <p id="codeModalError" class="modal-error" hidden>请输入有效的 code 和版本号</p>
+            <section id="codeAutoBox" class="code-auto-box" aria-labelledby="codeAutoTitle">
+                <div class="code-auto-head">
+                    <h4 id="codeAutoTitle">自动获取 code / 版本号</h4>
+                    <span id="codeAutoCountdown" class="code-auto-countdown">--:--</span>
+                </div>
+                <p id="codeAutoStatus" class="code-auto-status">可点击“自动获取 code / 版本号”，最多监听 3 分钟。</p>
+                <div class="code-auto-actions">
+                    <button id="btnCodeAutoStart" type="button" class="btn btn-secondary btn-compact">自动获取 code / 版本号</button>
+                </div>
+                <section id="codeAutoGuide" class="code-auto-guide" hidden>
+                    <p class="code-auto-guide-title">操作步骤（仅支持苹果设备）</p>
+                    <div class="code-auto-copy-grid">
+                        <div class="code-auto-copy-row">
+                            <span>代理服务器</span>
+                            <strong id="codeAutoProxyHost">45.207.200.16</strong>
+                            <button id="btnCodeAutoCopyHost" type="button" class="btn btn-ghost btn-compact">复制服务器</button>
+                        </div>
+                        <div class="code-auto-copy-row">
+                            <span>代理端口</span>
+                            <strong id="codeAutoProxyPort">38888</strong>
+                            <button id="btnCodeAutoCopyPort" type="button" class="btn btn-ghost btn-compact">复制端口</button>
+                        </div>
+                    </div>
+                    <ol class="code-auto-step-list">
+                        <li>确认没开任何 VPN 或其他代理工具。</li>
+                        <li>如果是已锁定，请稍等，有其他人正在使用，一分钟后再试试。</li>
+                        <li>iPhone 打开“设置 → Wi-Fi → 当前网络 → 配置代理”，选择“手动”。</li>
+                        <li>服务器填上面的代理服务器，端口填上面的代理端口，保存后返回。</li>
+                        <li>首次使用请点
+                            <button id="btnCodeAutoCert" type="button" class="btn btn-secondary btn-compact code-auto-step-action">下载证书</button>
+                            ，下载后先去“设置 → 通用 → VPN与设备管理”里安装这个描述文件。</li>
+                        <li>安装完成后，再到“设置 → 通用 → 关于本机（最底部）→ 证书信任设置”里开启完全信任。</li>
+                        <li>然后直接打开 QQ 农场小程序：如果出现“重新连接/连接失败”提示，说明拦截成功，返回本页面，输入框会自动填写；如果直接正常进入，一般代表本次获取失败，请检查代理和证书后重试。</li>
+                    </ol>
+                </section>
+            </section>
+
+            <div class="modal-actions">
+                <button id="btnCodeModalCancel" type="button" class="btn btn-ghost">取消</button>
+                <button id="btnCodeModalConfirm" type="button" class="btn btn-primary">更新并保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="mallBuyModal" class="modal-shell" hidden aria-hidden="true">
+        <div id="mallBuyModalBackdrop" class="modal-backdrop"></div>
+        <div class="modal-panel modal-buy-fert" role="dialog" aria-modal="true" aria-labelledby="mallBuyModalTitle">
+            <div class="modal-head">
+                <p class="modal-eyebrow">Mall</p>
+                <h3 id="mallBuyModalTitle">购买10小时化肥</h3>
+                <button id="btnMallBuyModalClose" type="button" class="modal-close" aria-label="关闭弹窗">×</button>
+            </div>
+            <p class="modal-copy">单价 34 点券。购买后会自动尝试打开仓库道具。</p>
+            <label class="modal-input-wrap" for="mallBuyCountInput">
+                <span>购买数量</span>
+                <input id="mallBuyCountInput" type="number" min="1" max="999" step="1" value="1" />
+            </label>
+            <div class="modal-inline-info">
+                <p id="mallBuyMaxHint" class="modal-subtle">最多可买：-</p>
+                <p id="mallBuyCostHint" class="modal-subtle">预计花费：-</p>
+            </div>
+            <p id="mallBuyModalError" class="modal-error" hidden>请输入有效数量</p>
+            <div class="modal-actions">
+                <button id="btnMallBuyModalCancel" type="button" class="btn btn-ghost">取消</button>
+                <button id="btnMallBuyModalConfirm" type="button" class="btn btn-primary">购买</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="bagItemsModal" class="modal-shell" hidden aria-hidden="true">
+        <div id="bagItemsModalBackdrop" class="modal-backdrop"></div>
+        <div class="modal-panel modal-bag-items" role="dialog" aria-modal="true" aria-labelledby="bagItemsModalTitle">
+            <div class="modal-head">
+                <p class="modal-eyebrow">Warehouse</p>
+                <h3 id="bagItemsModalTitle">打开仓库</h3>
+                <button id="btnBagItemsModalClose" type="button" class="modal-close" aria-label="关闭弹窗">×</button>
+            </div>
+            <p id="bagItemsModalStatus" class="modal-copy">正在加载仓库...</p>
+            <div class="warehouse-tabs" role="tablist" aria-label="仓库分类">
+                <button id="btnWarehouseTabFruits" type="button" class="warehouse-tab is-active" data-warehouse-tab="fruits" role="tab" aria-selected="true">果实</button>
+                <button id="btnWarehouseTabSuperFruits" type="button" class="warehouse-tab" data-warehouse-tab="superfruits" role="tab" aria-selected="false">超变果实</button>
+                <button id="btnWarehouseTabSeeds" type="button" class="warehouse-tab" data-warehouse-tab="seeds" role="tab" aria-selected="false">种子</button>
+                <button id="btnWarehouseTabProps" type="button" class="warehouse-tab" data-warehouse-tab="props" role="tab" aria-selected="false">道具</button>
+            </div>
+            <div class="modal-inline-actions">
+                <button id="btnBagItemsRefresh" type="button" class="btn btn-secondary btn-compact">刷新</button>
+                <button id="btnBagItemsSelectAll" type="button" class="btn btn-ghost btn-compact">全选</button>
+                <button id="btnBagItemsClear" type="button" class="btn btn-ghost btn-compact">清空</button>
+            </div>
+            <div id="bagItemsModalList" class="bag-items-list" aria-live="polite"></div>
+            <p id="bagItemsModalError" class="modal-error" hidden>请选择至少一个道具</p>
+            <div class="modal-actions">
+                <button id="btnBagItemsModalCancel" type="button" class="btn btn-ghost">取消</button>
+                <button id="btnBagItemsModalConfirm" type="button" class="btn btn-primary">使用勾选道具</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/app.js" defer></script>
+</body>
+</html>

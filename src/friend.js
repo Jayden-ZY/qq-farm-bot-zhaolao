@@ -1,62 +1,208 @@
-/**
- * 好友农场操作 - 进入/离开/帮忙/偷菜/巡查
+﻿/**
+
  */
 
 const fs = require('fs');
 const path = require('path');
 const { CONFIG, PlantPhase, PHASE_NAMES } = require('./config');
 const { types } = require('./proto');
-const { sendMsgAsync, getUserState, networkEvents } = require('./network');
-const { toLong, toNum, getServerTimeSec, log, logWarn, sleep } = require('./utils');
+const { sendMsgAsync, getUserState, networkEvents, getAsyncSendLoad } = require('./network');
+const { toLong, toNum, getServerTimeSec, log, logWarn, sleep, sanitizeLogText } = require('./utils');
 const { getCurrentPhase, setOperationLimitsCallback } = require('./farm');
-const { getPlantName } = require('./gameConfig');
+const { getPlantName, getPlantById } = require('./gameConfig');
 
 const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
 const WEBUI_CONFIG_PATH = _dataDir
     ? path.join(_dataDir, 'config.json')
     : path.resolve(__dirname, '../../qq-farm-webui/data/config.json');
+const WEBUI_FRIENDS_PATH = _dataDir
+    ? path.join(_dataDir, 'friends.json')
+    : path.resolve(__dirname, '../../qq-farm-webui/data/friends.json');
+const WEBUI_FRIEND_STATS_PATH = _dataDir
+    ? path.join(_dataDir, 'friend-stats.json')
+    : path.resolve(__dirname, '../../qq-farm-webui/data/friend-stats.json');
+const SEED_SHOP_DATA_PATH = path.resolve(__dirname, '../tools/seed-shop-merged-export.json');
 let webuiConfigMtimeMs = -1;
 let webuiConfigCache = null;
+let seedRequiredLevelMap = null;
+let lastWebuiFriendsWriteErrorMsg = '';
+let lastWebuiFriendsWriteErrorAt = 0;
+let friendStatsCache = null;
+let friendStatsDirty = false;
+let lastWebuiFriendStatsWriteErrorMsg = '';
+let lastWebuiFriendStatsWriteErrorAt = 0;
 
-// ============ 内部状态 ============
+
 let isCheckingFriends = false;
 let isFirstFriendCheck = true;
 let friendCheckTimer = null;
 let friendLoopRunning = false;
-let lastResetDate = '';  // 上次重置日期 (YYYY-MM-DD)
-let friendActiveStart = '';   // webui 配置的生效时段开始 "HH:MM"
-let friendActiveEnd = '';     // webui 配置的生效时段结束 "HH:MM"
-let lastWindowSkipLogAt = 0;  // 上次打"时段外跳过"日志的时间戳（防刷屏）
+let lastResetDate = '';
+let friendActiveStart = '';
+let friendActiveEnd = '';
+let friendActiveAllDay = false;
+let lastWindowSkipLogAt = 0;
+let friendApplyActiveStart = '';
+let friendApplyActiveEnd = '';
+let friendApplyAllDay = true;
+let lastApplyWindowSkipLogAt = 0;
+let friendActionSteal = true;
+let friendActionCare = true;
+let friendActionPrank = false;
+let friendStealLevelThreshold = 0;
+let friendStealEnabledMap = {};
+let friendStealEnabledMapSig = '{}';
+let friendAutoDeleteNoStealEnabled = false;
+let friendAutoDeleteNoStealDays = 7;
+let lastDailyActionAutoEnableDate = '';
+let friendPerformanceMode = 'standard';
+let friendActionDelayMs = 100;
+let friendBetweenFriendDelayMs = 500;
+let friendLoopTimeoutBackoffMs = 0;
+let friendNoActionStreak = 0;
+let lastFriendAutoDeleteNoStealSweepAt = 0;
+const LOOP_TIMEOUT_BACKOFF_BASE_MS = 1200;
+const LOOP_TIMEOUT_BACKOFF_MAX_MS = 8000;
+const BERSERK_MIN_LOOP_WAIT_MS = 420;
+const FRIEND_NETWORK_GUARD_MAX_MS = 2600;
+const FRIEND_MAX_COUNT = 511;
+const FRIEND_MANUAL_REQUEST_MAX_AGE_MS = 60 * 60 * 1000;
+const FRIEND_AUTO_DELETE_NO_STEAL_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
+const pendingFriendApplications = new Map(); // gid -> name
+const pendingFriendDeleteRequests = [];
+let isProcessingPendingFriendApplications = false;
+let isProcessingPendingFriendDeleteRequests = false;
+let lastFriendApplyFullLogAt = 0;
 
-// 经验追踪：记录帮助前的 dayExpTimes，操作后对比是否增长
-const expTracker = new Map();       // opId -> 帮助前的 dayExpTimes
-const expExhausted = new Set();     // 经验已耗尽的操作类型
-
-// 操作限制状态 (从服务器响应中更新)
-// 操作类型ID (根据游戏代码):
-// 10001 = 收获, 10002 = 铲除, 10003 = 放草, 10004 = 放虫
-// 10005 = 除草(帮好友), 10006 = 除虫(帮好友), 10007 = 浇水(帮好友), 10008 = 偷菜
-const operationLimits = new Map();
-
-// 操作类型名称映射
-const OP_NAMES = {
-    10001: '收获',
-    10002: '铲除',
-    10003: '放草',
-    10004: '放虫',
-    10005: '除草',
-    10006: '除虫',
-    10007: '浇水',
-    10008: '偷菜',
+const FRIEND_PERFORMANCE_PROFILES = {
+    standard: {
+        friendIntervalSec: 1,
+        actionDelayMs: 100,
+        betweenFriendDelayMs: 500,
+    },
+    retire: {
+        friendIntervalSec: 5,
+        actionDelayMs: 180,
+        betweenFriendDelayMs: 900,
+    },
+    berserk: {
+        friendIntervalSec: 0,
+        actionDelayMs: 85,
+        betweenFriendDelayMs: 280,
+    },
 };
 
-// 配置: 是否只在有经验时才帮助好友  
-const HELP_ONLY_WITH_EXP = true; // 已更新可用
+function getFriendNetworkGuardWaitMs() {
+    const load = getAsyncSendLoad();
+    if (!load) return 0;
 
-// 配置: 是否启用放虫放草功能
-const ENABLE_PUT_BAD_THINGS = false;  // 无效！！！开启后会多次访问朋友导致被拉黑 请勿更改暂时关闭放虫放草功能
+    const pending = Math.max(0, Number(load.pending) || 0);
+    const penaltyMs = Math.max(0, Number(load.penaltyMs) || 0);
+    const timeoutStreak = Math.max(0, Number(load.timeoutStreak) || 0);
+    const dynamicGapMs = Math.max(0, Number(load.dynamicGapMs) || 0);
 
-// ============ 好友 API ============
+    if (pending <= 0 && penaltyMs <= 0 && timeoutStreak <= 0) return 0;
+
+    const guardMs = Math.max(
+        Math.floor(dynamicGapMs * 2),
+        penaltyMs + pending * 340 + timeoutStreak * 520
+    );
+    return Math.min(guardMs, FRIEND_NETWORK_GUARD_MAX_MS);
+}
+
+
+const expTracker = new Map();
+const expExhausted = new Set();
+
+
+
+
+
+const operationLimits = new Map();
+
+
+const OP_NAMES = {
+    10001: 'STEAL',
+    10002: 'WATER',
+    10003: 'PUT_WEED',
+    10004: 'PUT_BUG',
+    10005: 'HELP_BUG',
+    10006: 'HELP_WEED',
+    10007: 'HELP_WATER',
+    10008: 'PRANK',
+};
+
+
+const HELP_ONLY_WITH_EXP = true;
+
+
+const ENABLE_PUT_BAD_THINGS = true;
+
+
+function getSeedRequiredLevelMap() {
+    if (seedRequiredLevelMap) return seedRequiredLevelMap;
+    seedRequiredLevelMap = new Map();
+    try {
+        if (!fs.existsSync(SEED_SHOP_DATA_PATH)) return seedRequiredLevelMap;
+        const parsed = JSON.parse(fs.readFileSync(SEED_SHOP_DATA_PATH, 'utf8'));
+        const rows = Array.isArray(parsed) ? parsed : (parsed.rows || parsed.seeds || []);
+        if (!Array.isArray(rows)) return seedRequiredLevelMap;
+
+        for (const row of rows) {
+            if (!row || typeof row !== 'object') continue;
+            const seedId = Number(row.seedId || row.seed_id);
+            if (!Number.isInteger(seedId) || seedId <= 0) continue;
+            const levelNeed = Number(row.requiredLevel || row.required_level || 0);
+            if (!Number.isFinite(levelNeed) || levelNeed < 0) continue;
+            seedRequiredLevelMap.set(seedId, Math.floor(levelNeed));
+        }
+    } catch (e) {
+        // ignore
+    }
+    return seedRequiredLevelMap;
+}
+
+function getPlantStealLevelNeed(plantId) {
+    const plant = getPlantById(plantId);
+    if (!plant || typeof plant !== 'object') return 0;
+    const seedId = Number(plant.seed_id || plant.seedId || 0);
+    if (!Number.isInteger(seedId) || seedId <= 0) return 0;
+    const levelNeed = getSeedRequiredLevelMap().get(seedId);
+    return Number.isInteger(levelNeed) && levelNeed >= 0 ? levelNeed : 0;
+}
+
+function normalizeFriendStealNameKey(name) {
+    const text = String(name || '').trim().toLowerCase();
+    if (!text) return '';
+    return text.replace(/\s+/g, ' ');
+}
+
+function getFriendStealKey(friend) {
+    const gid = toNum(friend && friend.gid);
+    if (gid > 0) return String(gid);
+    const nameKey = normalizeFriendStealNameKey(friend && friend.name);
+    return nameKey ? `name:${nameKey}` : '';
+}
+
+function normalizeFriendStealEnabled(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const map = {};
+    let count = 0;
+    for (const [k, v] of Object.entries(raw)) {
+        if (count >= 10000) break;
+        const key = String(k || '').trim();
+        if (!key || key.length > 80) continue;
+        map[key] = v !== false;
+        count += 1;
+    }
+    return map;
+}
+
+function isFriendStealEnabled(friend) {
+    const key = getFriendStealKey(friend);
+    if (!key) return true;
+    return friendStealEnabledMap[key] !== false;
+}
 
 async function getAllFriends() {
     const body = types.GetAllFriendsRequest.encode(types.GetAllFriendsRequest.create({})).finish();
@@ -64,7 +210,398 @@ async function getAllFriends() {
     return types.GetAllFriendsReply.decode(replyBody);
 }
 
-// ============ 好友申请 API (微信同玩) ============
+async function getFriendCapacityInfo() {
+    const friendsReply = await getAllFriends();
+    const friends = Array.isArray(friendsReply && friendsReply.game_friends) ? friendsReply.game_friends : [];
+    const currentCount = friends.length;
+    const remainingSlots = Math.max(0, FRIEND_MAX_COUNT - currentCount);
+    return { currentCount, remainingSlots };
+}
+
+function normalizeFriendDeleteRequests(raw) {
+    if (!Array.isArray(raw)) return [];
+    const rows = [];
+    const seen = new Set();
+    for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        if (rows.length >= 50) break;
+        const requestId = String(item.requestId || '').trim().slice(0, 80);
+        const gid = toNum(item.gid);
+        if (!requestId || gid <= 0 || seen.has(requestId)) continue;
+        seen.add(requestId);
+        rows.push({
+            requestId,
+            gid,
+            name: String(item.name || '').trim().slice(0, 80),
+            requestedAtMs: Math.max(0, Number(item.requestedAtMs) || 0),
+        });
+    }
+    return rows;
+}
+
+function shouldIgnoreStaleFriendRequest(reqAtMs) {
+    const n = Number(reqAtMs || 0);
+    if (!Number.isFinite(n) || n <= 0) return false;
+    return (Date.now() - n) > FRIEND_MANUAL_REQUEST_MAX_AGE_MS;
+}
+
+function enqueueFriendDeleteRequests(requests) {
+    const rows = Array.isArray(requests) ? requests : [];
+    if (rows.length <= 0) return [];
+
+    const knownIds = new Set(pendingFriendDeleteRequests.map((item) => String(item.requestId || '').trim()));
+    const knownGids = new Set(pendingFriendDeleteRequests.map((item) => toNum(item && item.gid)).filter((gid) => gid > 0));
+    const added = [];
+    for (const item of rows) {
+        if (!item || typeof item !== 'object') continue;
+        const requestId = String(item.requestId || '').trim();
+        if (!requestId || knownIds.has(requestId)) continue;
+        const gid = toNum(item.gid);
+        if (gid <= 0 || knownGids.has(gid)) continue;
+        const request = {
+            requestId,
+            gid,
+            name: String(item.name || '').trim().slice(0, 80),
+            requestedAtMs: Math.max(0, Number(item.requestedAtMs) || 0),
+        };
+        pendingFriendDeleteRequests.push(request);
+        knownIds.add(requestId);
+        knownGids.add(gid);
+        added.push(request);
+    }
+    return added;
+}
+
+function removeFriendDeleteRequestsFromConfig(requestIds) {
+    const ids = new Set((Array.isArray(requestIds) ? requestIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean));
+    if (ids.size <= 0) return;
+
+    const current = readWebuiConfig() || {};
+    const currentRows = normalizeFriendDeleteRequests(current.friendDeleteRequests);
+    if (currentRows.length <= 0) return;
+    const nextRows = currentRows.filter((item) => !ids.has(item.requestId));
+    if (nextRows.length === currentRows.length) return;
+    writeWebuiConfigPatch({ friendDeleteRequests: nextRows });
+}
+
+function parseRuntimeIsoToMs(value) {
+    const text = String(value || '').trim();
+    if (!text) return 0;
+    const ms = Date.parse(text);
+    return Number.isFinite(ms) ? ms : 0;
+}
+
+function maybeQueueAutoDeleteNoStealFriends(friends, myGid) {
+    if (!friendAutoDeleteNoStealEnabled || !friendActionSteal) return;
+    const days = Math.max(1, Math.floor(Number(friendAutoDeleteNoStealDays) || 0));
+    if (days <= 0) return;
+
+    const now = Date.now();
+    if (lastFriendAutoDeleteNoStealSweepAt > 0 && (now - lastFriendAutoDeleteNoStealSweepAt) < FRIEND_AUTO_DELETE_NO_STEAL_SWEEP_INTERVAL_MS) {
+        return;
+    }
+    lastFriendAutoDeleteNoStealSweepAt = now;
+
+    const thresholdMs = days * 24 * 60 * 60 * 1000;
+    const stats = getFriendStatsCache();
+    const rows = Array.isArray(friends) ? friends : [];
+    const requests = [];
+
+    for (const raw of rows) {
+        const friend = normalizeWebuiFriend(raw, myGid);
+        if (!friend || !isFriendStealEnabled(friend)) continue;
+
+        const key = getFriendStatsKey(friend);
+        const row = key ? stats.friends[key] : null;
+        const lastStealMs = parseRuntimeIsoToMs(row && row.lastStealAt);
+        const firstSeenMs = parseRuntimeIsoToMs(row && row.firstSeenAt) || parseRuntimeIsoToMs(stats.created_at);
+        const referenceMs = lastStealMs > 0 ? lastStealMs : firstSeenMs;
+        if (referenceMs <= 0 || (now - referenceMs) < thresholdMs) continue;
+
+        requests.push({
+            requestId: `auto-no-steal:${friend.gid}`,
+            gid: friend.gid,
+            name: friend.name,
+            requestedAtMs: now,
+        });
+    }
+
+    const added = enqueueFriendDeleteRequests(requests);
+    if (added.length > 0) {
+        const names = added
+            .map((item) => normalizeRuntimeText(item.name || `GID:${item.gid}`).slice(0, 24) || `GID:${item.gid}`)
+            .join(', ');
+        log('FRIEND_DELETE', `连续${days}天未成功偷菜，已加入自动删除 ${added.length} 人：${names}`);
+    }
+}
+
+function normalizeWebuiFriend(friend, myGid) {
+    if (!friend || typeof friend !== 'object') return null;
+    const gid = toNum(friend.gid);
+    if (!gid || (myGid > 0 && gid === myGid)) return null;
+    const nick = String(friend.name || '').trim();
+    const remark = String(friend.remark || '').trim();
+    const name = remark || nick || `GID:${gid}`;
+    const plant = friend.plant || null;
+    return {
+        gid,
+        name,
+        nick,
+        remark,
+        level: toNum(friend.level),
+        preview: {
+            stealPlantNum: plant ? toNum(plant.steal_plant_num) : 0,
+            dryNum: plant ? toNum(plant.dry_num) : 0,
+            weedNum: plant ? toNum(plant.weed_num) : 0,
+            insectNum: plant ? toNum(plant.insect_num) : 0,
+        },
+    };
+}
+
+function writeWebuiFriendsSnapshot(friends, myGid) {
+    try {
+        const rows = (Array.isArray(friends) ? friends : [])
+            .map((friend) => normalizeWebuiFriend(friend, myGid))
+            .filter(Boolean);
+        const payload = {
+            version: 1,
+            source: 'qq-farm-bot',
+            updated_at: new Date().toISOString(),
+            total: rows.length,
+            friends: rows,
+        };
+
+        fs.mkdirSync(path.dirname(WEBUI_FRIENDS_PATH), { recursive: true });
+        const tmpPath = `${WEBUI_FRIENDS_PATH}.tmp`;
+        fs.writeFileSync(tmpPath, `${JSON.stringify(payload)}\n`, 'utf8');
+        fs.renameSync(tmpPath, WEBUI_FRIENDS_PATH);
+        lastWebuiFriendsWriteErrorMsg = '';
+    } catch (e) {
+        const now = Date.now();
+        const msg = e && e.message ? e.message : String(e);
+        if (msg !== lastWebuiFriendsWriteErrorMsg || (now - lastWebuiFriendsWriteErrorAt) > 60_000) {
+            logWarn('WEBUI', '好友列表写入失败: ' + msg);
+            lastWebuiFriendsWriteErrorMsg = msg;
+            lastWebuiFriendsWriteErrorAt = now;
+        }
+    }
+}
+
+function createEmptyFriendStats() {
+    const now = new Date().toISOString();
+    return {
+        version: 1,
+        source: 'qq-farm-bot',
+        created_at: now,
+        updated_at: now,
+        totals: {
+            visits: 0,
+            stealCount: 0,
+            careCount: 0,
+            prankCount: 0,
+            failCount: 0,
+        },
+        friends: {},
+    };
+}
+
+function sanitizeFriendStats(raw) {
+    const base = createEmptyFriendStats();
+    if (!raw || typeof raw !== 'object') return base;
+    const next = {
+        ...base,
+        ...raw,
+        totals: { ...base.totals, ...(raw.totals && typeof raw.totals === 'object' ? raw.totals : {}) },
+        friends: {},
+    };
+    const rows = raw.friends && typeof raw.friends === 'object' ? raw.friends : {};
+    for (const [k, v] of Object.entries(rows)) {
+        if (!v || typeof v !== 'object') continue;
+        next.friends[String(k)] = {
+            gid: toNum(v.gid),
+            name: String(v.name || '').trim(),
+            nick: String(v.nick || '').trim(),
+            remark: String(v.remark || '').trim(),
+            firstSeenAt: String(v.firstSeenAt || raw.created_at || base.created_at || ''),
+            level: toNum(v.level),
+            visits: Math.max(0, toNum(v.visits)),
+            stealCount: Math.max(0, toNum(v.stealCount)),
+            careCount: Math.max(0, toNum(v.careCount)),
+            prankCount: Math.max(0, toNum(v.prankCount)),
+            failCount: Math.max(0, toNum(v.failCount)),
+            previewStealNum: Math.max(0, toNum(v.previewStealNum)),
+            previewDryNum: Math.max(0, toNum(v.previewDryNum)),
+            previewWeedNum: Math.max(0, toNum(v.previewWeedNum)),
+            previewInsectNum: Math.max(0, toNum(v.previewInsectNum)),
+            lastVisitAt: String(v.lastVisitAt || ''),
+            lastStealAt: String(v.lastStealAt || ''),
+            lastFailAt: String(v.lastFailAt || ''),
+            stealPlants: (v.stealPlants && typeof v.stealPlants === 'object') ? { ...v.stealPlants } : {},
+        };
+    }
+    return next;
+}
+
+function getFriendStatsCache() {
+    if (friendStatsCache) return friendStatsCache;
+    try {
+        if (fs.existsSync(WEBUI_FRIEND_STATS_PATH)) {
+            const parsed = JSON.parse(fs.readFileSync(WEBUI_FRIEND_STATS_PATH, 'utf8'));
+            friendStatsCache = sanitizeFriendStats(parsed);
+            return friendStatsCache;
+        }
+    } catch (e) {
+        // ignore and rebuild
+    }
+    friendStatsCache = createEmptyFriendStats();
+    return friendStatsCache;
+}
+
+function markFriendStatsDirty() {
+    friendStatsDirty = true;
+    const stats = getFriendStatsCache();
+    stats.updated_at = new Date().toISOString();
+}
+
+function flushFriendStatsIfDirty() {
+    if (!friendStatsDirty) return;
+    try {
+        const stats = getFriendStatsCache();
+        fs.mkdirSync(path.dirname(WEBUI_FRIEND_STATS_PATH), { recursive: true });
+        const tmpPath = `${WEBUI_FRIEND_STATS_PATH}.tmp`;
+        fs.writeFileSync(tmpPath, `${JSON.stringify(stats)}\n`, 'utf8');
+        fs.renameSync(tmpPath, WEBUI_FRIEND_STATS_PATH);
+        friendStatsDirty = false;
+        lastWebuiFriendStatsWriteErrorMsg = '';
+    } catch (e) {
+        const now = Date.now();
+        const msg = e && e.message ? e.message : String(e);
+        if (msg !== lastWebuiFriendStatsWriteErrorMsg || (now - lastWebuiFriendStatsWriteErrorAt) > 60_000) {
+            logWarn('WEBUI', '好友统计写入失败: ' + msg);
+            lastWebuiFriendStatsWriteErrorMsg = msg;
+            lastWebuiFriendStatsWriteErrorAt = now;
+        }
+    }
+}
+
+function getFriendStatsKey(friend) {
+    const gid = toNum(friend && friend.gid);
+    if (gid > 0) return String(gid);
+    const name = String(friend && friend.name || '').trim();
+    return name ? `name:${name}` : '';
+}
+
+function ensureFriendStatsRow(friend) {
+    const key = getFriendStatsKey(friend);
+    if (!key) return null;
+    const stats = getFriendStatsCache();
+    if (!stats.friends[key]) {
+        stats.friends[key] = {
+            gid: toNum(friend && friend.gid),
+            name: String(friend && friend.name || '').trim(),
+            nick: String(friend && friend.nick || '').trim(),
+            remark: String(friend && friend.remark || '').trim(),
+            firstSeenAt: new Date().toISOString(),
+            level: toNum(friend && friend.level),
+            visits: 0,
+            stealCount: 0,
+            careCount: 0,
+            prankCount: 0,
+            failCount: 0,
+            previewStealNum: 0,
+            previewDryNum: 0,
+            previewWeedNum: 0,
+            previewInsectNum: 0,
+            lastVisitAt: '',
+            lastStealAt: '',
+            lastFailAt: '',
+            stealPlants: {},
+        };
+    }
+    if (!stats.friends[key].firstSeenAt) {
+        stats.friends[key].firstSeenAt = String(stats.created_at || new Date().toISOString());
+    }
+    return stats.friends[key];
+}
+
+function syncFriendStatsFromOfficialList(friends, myGid) {
+    const list = Array.isArray(friends) ? friends : [];
+    for (const f of list) {
+        const friend = normalizeWebuiFriend(f, myGid);
+        if (!friend) continue;
+        const row = ensureFriendStatsRow(friend);
+        if (!row) continue;
+        row.gid = friend.gid;
+        row.name = friend.name;
+        row.nick = friend.nick;
+        row.remark = friend.remark;
+        row.level = toNum(friend.level);
+        row.previewStealNum = Math.max(0, toNum(friend.preview && friend.preview.stealPlantNum));
+        row.previewDryNum = Math.max(0, toNum(friend.preview && friend.preview.dryNum));
+        row.previewWeedNum = Math.max(0, toNum(friend.preview && friend.preview.weedNum));
+        row.previewInsectNum = Math.max(0, toNum(friend.preview && friend.preview.insectNum));
+    }
+    markFriendStatsDirty();
+}
+
+function recordFriendVisitFailure(friend, errMsg) {
+    const row = ensureFriendStatsRow(friend);
+    if (!row) return;
+    const stats = getFriendStatsCache();
+    row.failCount += 1;
+    row.lastFailAt = new Date().toISOString();
+    stats.totals.failCount += 1;
+    markFriendStatsDirty();
+}
+
+function recordFriendActionStats(friend, actionDetail, enteredFarm = true) {
+    const row = ensureFriendStatsRow(friend);
+    if (!row) return;
+    const stats = getFriendStatsCache();
+    const nowIso = new Date().toISOString();
+
+    if (enteredFarm) {
+        row.visits += 1;
+        row.lastVisitAt = nowIso;
+        stats.totals.visits += 1;
+    }
+
+    const steal = Math.max(0, toNum(actionDetail && actionDetail.steal));
+    const careWater = Math.max(0, toNum(actionDetail && actionDetail.careWater));
+    const careWeed = Math.max(0, toNum(actionDetail && actionDetail.careWeed));
+    const careBug = Math.max(0, toNum(actionDetail && actionDetail.careBug));
+    const prankBug = Math.max(0, toNum(actionDetail && actionDetail.prankBug));
+    const prankWeed = Math.max(0, toNum(actionDetail && actionDetail.prankWeed));
+    const care = careWater + careWeed + careBug;
+    const prank = prankBug + prankWeed;
+
+    if (steal > 0) {
+        row.stealCount += steal;
+        row.lastStealAt = nowIso;
+        stats.totals.stealCount += steal;
+    }
+    if (care > 0) {
+        row.careCount += care;
+        stats.totals.careCount += care;
+    }
+    if (prank > 0) {
+        row.prankCount += prank;
+        stats.totals.prankCount += prank;
+    }
+
+    const plants = Array.isArray(actionDetail && actionDetail.stealPlants) ? actionDetail.stealPlants : [];
+    for (const plant of plants) {
+        const name = String(plant || '').trim();
+        if (!name) continue;
+        row.stealPlants[name] = Math.max(0, toNum(row.stealPlants[name])) + 1;
+    }
+
+    markFriendStatsDirty();
+}
+
+
 
 async function getApplications() {
     const body = types.GetApplicationsRequest.encode(types.GetApplicationsRequest.create({})).finish();
@@ -80,10 +617,18 @@ async function acceptFriends(gids) {
     return types.AcceptFriendsReply.decode(replyBody);
 }
 
-async function enterFriendFarm(friendGid) {
+async function deleteFriend(friendGid) {
+    const body = types.DelFriendRequest.encode(types.DelFriendRequest.create({
+        friend_gid: toLong(friendGid),
+    })).finish();
+    const { body: replyBody } = await sendMsgAsync('gamepb.friendpb.FriendService', 'DelFriend', body);
+    return types.DelFriendReply.decode(replyBody || Buffer.alloc(0));
+}
+
+async function enterFriendFarm(friendGid, reason = 2) {
     const body = types.VisitEnterRequest.encode(types.VisitEnterRequest.create({
         host_gid: toLong(friendGid),
-        reason: 2,  // ENTER_REASON_FRIEND
+        reason,  // 2=FRIEND, 3=INTERACT
     })).finish();
     const { body: replyBody } = await sendMsgAsync('gamepb.visitpb.VisitService', 'Enter', body);
     return types.VisitEnterReply.decode(replyBody);
@@ -95,7 +640,8 @@ async function leaveFriendFarm(friendGid) {
     })).finish();
     try {
         await sendMsgAsync('gamepb.visitpb.VisitService', 'Leave', body);
-    } catch (e) { /* 离开失败不影响主流程 */ }
+    } catch (e) {
+}
 }
 
 function getLocalDateKey() {
@@ -106,14 +652,18 @@ function getLocalDateKey() {
     return `${y}-${m}-${day}`;
 }
 
+function normalizeRuntimeText(value) {
+    return sanitizeLogText(value);
+}
+
 /**
- * 检查是否需要重置每日限制 (0点刷新)
+ * Friend farm patrol loop and interactions.
  */
 function checkDailyReset() {
     const today = getLocalDateKey();  // YYYY-MM-DD
     if (lastResetDate !== today) {
         if (lastResetDate !== '') {
-            log('系统', '跨日重置，清空操作限制缓存');
+            log('CONFIG', '已完成每日重置：次数限制与经验追踪已清空');
         }
         operationLimits.clear();
         expExhausted.clear();
@@ -123,8 +673,45 @@ function checkDailyReset() {
 }
 
 /**
- * 更新操作限制状态
+
  */
+function maybeAutoEnableDailyFriendActions() {
+    const now = new Date();
+    const today = getLocalDateKey();
+    if (lastDailyActionAutoEnableDate === today) return;
+
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    const triggerAtMinutes = 5; // 00:05
+    // run once per day within 00:05-00:59 local time
+    if (nowMinutes < triggerAtMinutes || nowMinutes >= 60) return;
+
+    const toBool = (value, fallback) => {
+        if (value === undefined || value === null || value === '') return fallback;
+        const text = String(value).trim().toLowerCase();
+        if (['1', 'true', 'yes', 'on'].includes(text)) return true;
+        if (['0', 'false', 'no', 'off'].includes(text)) return false;
+        return fallback;
+    };
+
+    const cfg = readWebuiConfig() || {};
+    const legacyCare = toBool(cfg.friendActionWater, true)
+        || toBool(cfg.friendActionWeed, true)
+        || toBool(cfg.friendActionBug, true);
+    const careBefore = toBool(cfg.friendActionCare, legacyCare);
+    const prankBefore = toBool(cfg.friendActionPrank, false);
+
+    const updated = writeWebuiConfigPatch({
+        friendActionCare: true,
+        friendActionPrank: true,
+    });
+    if (!updated) return;
+
+    friendActionCare = true;
+    friendActionPrank = true;
+    lastDailyActionAutoEnableDate = today;
+    log('CONFIG', `00:05 每日自动开启：照顾 ${careBefore ? '开' : '关'}->开，捣乱 ${prankBefore ? '开' : '关'}->开`);
+}
+
 function updateOperationLimits(limits) {
     if (!limits || limits.length === 0) return;
     checkDailyReset();
@@ -140,38 +727,39 @@ function updateOperationLimits(limits) {
             };
             operationLimits.set(id, data);
 
-            // 经验追踪：如果之前标记了某操作，检查 dayExpTimes 是否增长
+
             if (expTracker.has(id)) {
                 const prevExpTimes = expTracker.get(id);
                 expTracker.delete(id);
                 if (newExpTimes <= prevExpTimes && !expExhausted.has(id)) {
-                    // 帮了好友但经验没涨 → 经验耗尽
+
                     expExhausted.add(id);
                     const name = OP_NAMES[id] || `#${id}`;
-                    log('限制', `${name} 经验已耗尽 (已获${newExpTimes}次)`);
+                    log('FRIEND_EXP', `${name} 经验次数已用尽（dayExpTimes=${newExpTimes}）`);
                 }
             }
         }
     }
+    maybeAutoDisableFriendCare();
 }
 
 /**
- * 检查某操作是否还能获得经验
- * dayExpTimesLimit 始终为0（服务器不提供），通过追踪 dayExpTimes 变化来判断
+
+
  */
 function canGetExp(opId) {
-    if (expExhausted.has(opId)) return false;  // 已确认耗尽
+    if (expExhausted.has(opId)) return false;
     const limit = operationLimits.get(opId);
-    if (!limit) return true;  // 没数据，允许尝试
-    // dayExpTimesLimit > 0 时按它来（虽然目前始终为0，留作兼容）
+    if (!limit) return true;
+
     if (limit.dayExpTimesLimit > 0) {
         return limit.dayExpTimes < limit.dayExpTimesLimit;
     }
-    return true;  // 等追踪机制检测耗尽
+    return true;
 }
 
 /**
- * 检查某操作是否还有次数
+
  */
 function canOperate(opId) {
     const limit = operationLimits.get(opId);
@@ -181,7 +769,7 @@ function canOperate(opId) {
 }
 
 /**
- * 帮助操作前调用：记录当前 dayExpTimes，操作后对比
+
  */
 function markExpCheck(opId) {
     const limit = operationLimits.get(opId);
@@ -191,7 +779,7 @@ function markExpCheck(opId) {
 }
 
 /**
- * 检查某操作是否还有次数
+
  */
 function canOperate(opId) {
     const limit = operationLimits.get(opId);
@@ -201,7 +789,7 @@ function canOperate(opId) {
 }
 
 /**
- * 获取某操作剩余次数
+
  */
 function getRemainingTimes(opId) {
     const limit = operationLimits.get(opId);
@@ -210,11 +798,11 @@ function getRemainingTimes(opId) {
 }
 
 /**
- * 获取操作限制摘要 (用于日志显示)
+
  */
 function getOperationLimitsSummary() {
     const parts = [];
-    // 帮助好友操作 (10005=除草, 10006=除虫, 10007=浇水, 10008=偷菜)
+
     for (const id of [10005, 10006, 10007, 10008]) {
         const limit = operationLimits.get(id);
         if (limit && limit.dayExpTimesLimit > 0) {
@@ -223,7 +811,7 @@ function getOperationLimitsSummary() {
             parts.push(`${name}${expLeft}/${limit.dayExpTimesLimit}`);
         }
     }
-    // 捣乱操作 (10003=放草, 10004=放虫)
+
     for (const id of [10003, 10004]) {
         const limit = operationLimits.get(id);
         if (limit && limit.dayTimesLimit > 0) {
@@ -302,36 +890,36 @@ async function putWeeds(friendGid, landIds) {
     return reply;
 }
 
-// ============ 好友土地分析 ============
 
-// 调试开关 - 设为好友名字可只查看该好友的土地分析详情，设为 true 查看全部，false 关闭
+
+
 const DEBUG_FRIEND_LANDS = false;
 
 function analyzeFriendLands(lands, myGid, friendName = '') {
     const result = {
-        stealable: [],   // 可偷
-        stealableInfo: [],  // 可偷植物信息 { landId, plantId, name }
-        needWater: [],   // 需要浇水
-        needWeed: [],    // 需要除草
-        needBug: [],     // 需要除虫
-        canPutWeed: [],  // 可以放草
-        canPutBug: [],   // 可以放虫
+        stealable: [],
+        stealableInfo: [],
+        needWater: [],
+        needWeed: [],
+        needBug: [],
+        canPutWeed: [],
+        canPutBug: [],
     };
 
     for (const land of lands) {
         const id = toNum(land.id);
         const plant = land.plant;
-        // 是否显示此好友的调试信息
+
         const showDebug = DEBUG_FRIEND_LANDS === true || DEBUG_FRIEND_LANDS === friendName;
 
         if (!plant || !plant.phases || plant.phases.length === 0) {
-            if (showDebug) console.log(`  [${friendName}] 土地#${id}: 无植物或无阶段数据`);
+            if (showDebug) console.log(`  [${friendName}] land ${id}: no phase data`);
             continue;
         }
 
-        const currentPhase = getCurrentPhase(plant.phases, showDebug, `[${friendName}]土地#${id}`);
+        const currentPhase = getCurrentPhase(plant.phases, showDebug, `[${friendName}] land ${id}`);
         if (!currentPhase) {
-            if (showDebug) console.log(`  [${friendName}] 土地#${id}: getCurrentPhase返回null`);
+            if (showDebug) console.log(`  [${friendName}] land ${id}: getCurrentPhase returned null`);
             continue;
         }
         const phaseVal = currentPhase.phase;
@@ -339,36 +927,37 @@ function analyzeFriendLands(lands, myGid, friendName = '') {
         if (showDebug) {
             const insectOwners = plant.insect_owners || [];
             const weedOwners = plant.weed_owners || [];
-            console.log(`  [${friendName}] 土地#${id}: phase=${phaseVal} stealable=${plant.stealable} dry=${toNum(plant.dry_num)} weed=${weedOwners.length} bug=${insectOwners.length}`);
+            console.log('  [' + friendName + '] land ' + id + ': phase=' + phaseVal + ' stealable=' + plant.stealable + ' dry=' + toNum(plant.dry_num) + ' weed=' + weedOwners.length + ' bug=' + insectOwners.length);
         }
 
         if (phaseVal === PlantPhase.MATURE) {
             if (plant.stealable) {
                 result.stealable.push(id);
                 const plantId = toNum(plant.id);
-                const plantName = getPlantName(plantId) || plant.name || '未知';
-                result.stealableInfo.push({ landId: id, plantId, name: plantName });
+                const plantName = getPlantName(plantId) || plant.name || 'unknown';
+                const levelNeed = getPlantStealLevelNeed(plantId);
+                result.stealableInfo.push({ landId: id, plantId, name: plantName, levelNeed });
             } else if (showDebug) {
-                console.log(`  [${friendName}] 土地#${id}: 成熟但stealable=false (可能已被偷过)`);
+                console.log('  [' + friendName + '] mature but not stealable: land ' + id);
             }
             continue;
         }
 
         if (phaseVal === PlantPhase.DEAD) continue;
 
-        // 帮助操作
+
         if (toNum(plant.dry_num) > 0) result.needWater.push(id);
         if (plant.weed_owners && plant.weed_owners.length > 0) result.needWeed.push(id);
         if (plant.insect_owners && plant.insect_owners.length > 0) result.needBug.push(id);
 
-        // 捣乱操作: 检查是否可以放草/放虫
-        // 条件: 没有草且我没放过草
+
+
         const weedOwners = plant.weed_owners || [];
         const insectOwners = plant.insect_owners || [];
         const iAlreadyPutWeed = weedOwners.some(gid => toNum(gid) === myGid);
         const iAlreadyPutBug = insectOwners.some(gid => toNum(gid) === myGid);
 
-        // 每块地最多2个草/虫，且我没放过
+
         if (weedOwners.length < 2 && !iAlreadyPutWeed) {
             result.canPutWeed.push(id);
         }
@@ -379,169 +968,334 @@ function analyzeFriendLands(lands, myGid, friendName = '') {
     return result;
 }
 
-// ============ 拜访好友 ============
+
 
 async function visitFriend(friend, totalActions, myGid) {
     const { gid, name } = friend;
+    const safeName = normalizeRuntimeText(name).slice(0, 48) || `GID:${gid}`;
     const showDebug = DEBUG_FRIEND_LANDS === true || DEBUG_FRIEND_LANDS === name;
+    const perActionDelayMs = Math.max(0, Math.floor(Number(friendActionDelayMs) || 0));
+    const waitAction = async () => {
+        if (perActionDelayMs > 0) await sleep(perActionDelayMs);
+    };
 
     if (showDebug) {
-        console.log(`\n========== 调试: 进入好友 [${name}] 农场 ==========`);
+        console.log('\\n========== friend debug start: ' + safeName + ' ==========');
     }
 
     let enterReply;
     try {
-        enterReply = await enterFriendFarm(gid);
+        const enterReason = 2;
+        if (friendActionPrank && ENABLE_PUT_BAD_THINGS) {
+            log('PRANK', `进入好友农场准备捣乱：${safeName}，reason=${enterReason}`);
+        }
+        enterReply = await enterFriendFarm(gid, enterReason);
     } catch (e) {
-        logWarn('好友', `进入 ${name} 农场失败: ${e.message}`);
+        const errText = normalizeRuntimeText(e && e.message ? e.message : String(e));
+        recordFriendVisitFailure(friend, errText);
+        logWarn('FRIEND', `进入 ${safeName} 农场失败：${errText}`);
         return;
     }
 
     const lands = enterReply.lands || [];
     if (showDebug) {
-        console.log(`  [${name}] 获取到 ${lands.length} 块土地`);
+        console.log(`  [${safeName}] loaded friend lands count=${lands.length}`);
     }
     if (lands.length === 0) {
+        recordFriendActionStats(friend, {
+            steal: 0,
+            stealPlants: [],
+            careWater: 0,
+            careWeed: 0,
+            careBug: 0,
+            prankBug: 0,
+            prankWeed: 0,
+        }, true);
         await leaveFriendFarm(gid);
         return;
     }
 
     const status = analyzeFriendLands(lands, myGid, name);
+    const prankDiagEnabled = friendActionPrank && ENABLE_PUT_BAD_THINGS;
+    const prankBugRemainingBefore = prankDiagEnabled && canOperate(10004) ? getRemainingTimes(10004) : 0;
+    const prankWeedRemainingBefore = prankDiagEnabled && canOperate(10003) ? getRemainingTimes(10003) : 0;
+    let prankBugAttempted = 0;
+    let prankBugFail = 0;
+    let prankBugFirstErr = '';
+    let prankWeedAttempted = 0;
+    let prankWeedFail = 0;
+    let prankWeedFirstErr = '';
+    let prankDisabledByFailure = false;
     
     if (showDebug) {
-        console.log(`  [${name}] 分析结果: 可偷=${status.stealable.length} 浇水=${status.needWater.length} 除草=${status.needWeed.length} 除虫=${status.needBug.length}`);
-        console.log(`========== 调试结束 ==========\n`);
+        console.log(`  [${name}] land summary: stealable=${status.stealable.length} water=${status.needWater.length} weed=${status.needWeed.length} bug=${status.needBug.length}`);
+        console.log('========== friend debug ready: ' + name + ' ==========');
     }
 
-    // 执行操作
-    const actions = [];
 
-    // 帮助操作: 只在有经验时执行 (如果启用了 HELP_ONLY_WITH_EXP)
-    if (status.needWeed.length > 0) {
-        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10005);  // 10005=除草
+    if (prankDiagEnabled) {
+        log('PRANK', `捣乱开始：${name}，剩余放虫=${prankBugRemainingBefore}，剩余放草=${prankWeedRemainingBefore}`);
+    }
+
+    const actionDetail = {
+        steal: 0,
+        stealPlants: [],
+        careWater: 0,
+        careWeed: 0,
+        careBug: 0,
+        prankBug: 0,
+        prankWeed: 0,
+    };
+
+
+    const stealEnabledForFriend = friend.stealEnabled !== false && isFriendStealEnabled(friend);
+    if (friendActionSteal && stealEnabledForFriend && status.stealable.length > 0) {
+        const stealTargets = [];
+        for (let i = 0; i < status.stealable.length; i++) {
+            const landId = status.stealable[i];
+            const info = status.stealableInfo[i] || null;
+            const levelNeed = Number(info && info.levelNeed || 0);
+            if (friendStealLevelThreshold > 0 && !(levelNeed > friendStealLevelThreshold)) {
+                continue;
+            }
+            stealTargets.push({ landId, info });
+        }
+
+        let ok = 0;
+        const stolenPlants = [];
+        for (const target of stealTargets) {
+            try {
+                await stealHarvest(gid, [target.landId]);
+                ok++;
+                if (target.info && target.info.name) {
+                    stolenPlants.push(normalizeRuntimeText(target.info.name).slice(0, 24));
+                }
+            } catch (e) { /* ignore */ }
+            await waitAction();
+        }
+        if (ok > 0) {
+            actionDetail.steal += ok;
+            actionDetail.stealPlants.push(...stolenPlants);
+            totalActions.steal += ok;
+        }
+    }
+
+
+    if (friendActionCare && status.needWeed.length > 0) {
+        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10005);
         if (shouldHelp) {
             markExpCheck(10005);
             let ok = 0;
             for (const landId of status.needWeed) {
                 try { await helpWeed(gid, [landId]); ok++; } catch (e) { /* ignore */ }
-                await sleep(100);
+                await waitAction();
             }
-            if (ok > 0) { actions.push(`草${ok}`); totalActions.weed += ok; }
+            if (ok > 0) {
+                actionDetail.careWeed += ok;
+                totalActions.weed += ok;
+            }
         }
     }
 
-    if (status.needBug.length > 0) {
-        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10006);  // 10006=除虫
+    if (friendActionCare && status.needBug.length > 0) {
+        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10006);
         if (shouldHelp) {
             markExpCheck(10006);
             let ok = 0;
             for (const landId of status.needBug) {
                 try { await helpInsecticide(gid, [landId]); ok++; } catch (e) { /* ignore */ }
-                await sleep(100);
+                await waitAction();
             }
-            if (ok > 0) { actions.push(`虫${ok}`); totalActions.bug += ok; }
+            if (ok > 0) {
+                actionDetail.careBug += ok;
+                totalActions.bug += ok;
+            }
         }
     }
 
-    if (status.needWater.length > 0) {
-        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10007);  // 10007=浇水
+    if (friendActionCare && status.needWater.length > 0) {
+        const shouldHelp = !HELP_ONLY_WITH_EXP || canGetExp(10007);
         if (shouldHelp) {
             markExpCheck(10007);
             let ok = 0;
             for (const landId of status.needWater) {
                 try { await helpWater(gid, [landId]); ok++; } catch (e) { /* ignore */ }
-                await sleep(100);
+                await waitAction();
             }
-            if (ok > 0) { actions.push(`水${ok}`); totalActions.water += ok; }
+            if (ok > 0) {
+                actionDetail.careWater += ok;
+                totalActions.water += ok;
+            }
         }
     }
 
-    // 偷菜: 始终执行
-    if (status.stealable.length > 0) {
-        let ok = 0;
-        const stolenPlants = [];
-        for (let i = 0; i < status.stealable.length; i++) {
-            const landId = status.stealable[i];
-            try {
-                await stealHarvest(gid, [landId]);
-                ok++;
-                if (status.stealableInfo[i]) {
-                    stolenPlants.push(status.stealableInfo[i].name);
-                }
-            } catch (e) { /* ignore */ }
-            await sleep(100);
-        }
-        if (ok > 0) {
-            const plantNames = [...new Set(stolenPlants)].join('/');
-            actions.push(`偷${ok}${plantNames ? '(' + plantNames + ')' : ''}`);
-            totalActions.steal += ok;
-        }
-    }
 
-    // 捣乱操作: 放虫(10004)/放草(10003)
-    if (ENABLE_PUT_BAD_THINGS && status.canPutBug.length > 0 && canOperate(10004)) {
+    if (friendActionPrank && ENABLE_PUT_BAD_THINGS && status.canPutBug.length > 0 && canOperate(10004)) {
         let ok = 0;
         const remaining = getRemainingTimes(10004);
         const toProcess = status.canPutBug.slice(0, remaining);
         for (const landId of toProcess) {
             if (!canOperate(10004)) break;
-            try { await putInsects(gid, [landId]); ok++; } catch (e) { /* ignore */ }
-            await sleep(100);
+            prankBugAttempted++;
+            try {
+                await putInsects(gid, [landId]);
+                ok++;
+            } catch (e) {
+                prankBugFail++;
+                if (!prankBugFirstErr) prankBugFirstErr = e && e.message ? e.message : String(e);
+                prankDisabledByFailure = maybeAutoDisableFriendPrankOnFailure('putInsects_failed', prankBugFirstErr) || prankDisabledByFailure;
+                break;
+            }
+            await waitAction();
         }
-        if (ok > 0) { actions.push(`放虫${ok}`); totalActions.putBug += ok; }
+        if (ok > 0) {
+            actionDetail.prankBug += ok;
+            totalActions.putBug += ok;
+        }
     }
 
-    if (ENABLE_PUT_BAD_THINGS && status.canPutWeed.length > 0 && canOperate(10003)) {
+    if (friendActionPrank && ENABLE_PUT_BAD_THINGS && status.canPutWeed.length > 0 && canOperate(10003)) {
         let ok = 0;
         const remaining = getRemainingTimes(10003);
         const toProcess = status.canPutWeed.slice(0, remaining);
         for (const landId of toProcess) {
             if (!canOperate(10003)) break;
-            try { await putWeeds(gid, [landId]); ok++; } catch (e) { /* ignore */ }
-            await sleep(100);
+            prankWeedAttempted++;
+            try {
+                await putWeeds(gid, [landId]);
+                ok++;
+            } catch (e) {
+                prankWeedFail++;
+                if (!prankWeedFirstErr) prankWeedFirstErr = e && e.message ? e.message : String(e);
+                prankDisabledByFailure = maybeAutoDisableFriendPrankOnFailure('putWeeds_failed', prankWeedFirstErr) || prankDisabledByFailure;
+                break;
+            }
+            await waitAction();
         }
-        if (ok > 0) { actions.push(`放草${ok}`); totalActions.putWeed += ok; }
+        if (ok > 0) {
+            actionDetail.prankWeed += ok;
+            totalActions.putWeed += ok;
+        }
+    }
+    if (prankDiagEnabled) {
+        const bugSuccess = prankBugAttempted - prankBugFail;
+        const weedSuccess = prankWeedAttempted - prankWeedFail;
+        const bugRemainingAfter = canOperate(10004) ? getRemainingTimes(10004) : 0;
+        const weedRemainingAfter = canOperate(10003) ? getRemainingTimes(10003) : 0;
+        const shouldLogPrankDiag =
+            prankBugAttempted > 0
+            || prankWeedAttempted > 0
+            || status.canPutBug.length > 0
+            || status.canPutWeed.length > 0
+            || (!friend.hasSteal && !friend.hasHelp);
+
+        if (shouldLogPrankDiag) {
+            let reasonText = 'no prank action quota remaining';
+            if (prankBugAttempted === 0 && prankWeedAttempted === 0) {
+                if (status.canPutBug.length === 0 && status.canPutWeed.length === 0) {
+                    reasonText = 'no prank action quota remaining';
+                } else if (prankBugRemainingBefore <= 0 && prankWeedRemainingBefore <= 0) {
+                    reasonText = 'no prank action quota remaining';
+                }
+            }
+
+            log('PRANK', '本轮捣乱诊断完成');
+        }
     }
 
-    if (actions.length > 0) {
-        log('好友', `${name}: ${actions.join('/')}`);
+    const actionSummary = [];
+    const stealCount = Math.max(0, Math.floor(Number(actionDetail.steal) || 0));
+    if (stealCount > 0) {
+        const plantNames = [...new Set(actionDetail.stealPlants)]
+            .map((name) => normalizeRuntimeText(name).slice(0, 24))
+            .filter(Boolean)
+            .slice(0, 8)
+            .join('/');
+        actionSummary.push(`偷菜${stealCount}${plantNames ? `(${plantNames})` : ''}`);
     }
+
+    const careWaterCount = Math.max(0, Math.floor(Number(actionDetail.careWater) || 0));
+    const careWeedCount = Math.max(0, Math.floor(Number(actionDetail.careWeed) || 0));
+    const careBugCount = Math.max(0, Math.floor(Number(actionDetail.careBug) || 0));
+    const careTotal = careWaterCount + careWeedCount + careBugCount;
+    if (careTotal > 0) {
+        const careParts = [];
+        if (careWaterCount > 0) careParts.push(`浇水${careWaterCount}`);
+        if (careWeedCount > 0) careParts.push(`除草${careWeedCount}`);
+        if (careBugCount > 0) careParts.push(`除虫${careBugCount}`);
+        actionSummary.push(`照顾${careTotal}${careParts.length ? `(${careParts.join('/')})` : ''}`);
+    }
+
+    const prankBugCount = Math.max(0, Math.floor(Number(actionDetail.prankBug) || 0));
+    const prankWeedCount = Math.max(0, Math.floor(Number(actionDetail.prankWeed) || 0));
+    const prankTotal = prankBugCount + prankWeedCount;
+    if (prankTotal > 0) {
+        const prankParts = [];
+        if (prankBugCount > 0) prankParts.push(`放虫${prankBugCount}`);
+        if (prankWeedCount > 0) prankParts.push(`放草${prankWeedCount}`);
+        actionSummary.push(`捣乱${prankTotal}${prankParts.length ? `(${prankParts.join('/')})` : ''}`);
+    }
+
+    if (actionSummary.length > 0) {
+        const safeName = normalizeRuntimeText(name).slice(0, 48) || `GID:${gid}`;
+        const safeSummary = normalizeRuntimeText(actionSummary.join(' | ')).slice(0, 220);
+        log('FRIEND', `${safeName}: ${safeSummary}`);
+    }
+
+    recordFriendActionStats(friend, actionDetail, true);
 
     await leaveFriendFarm(gid);
 }
 
-// ============ 好友巡查主循环 ============
+
 
 async function checkFriends() {
     const state = getUserState();
-    if (isCheckingFriends || !state.gid) return;
+    if (isCheckingFriends || !state.gid) return false;
     isCheckingFriends = true;
+    let checkTimedOut = false;
 
-    // 检查是否跨日需要重置
+    // Reset daily action flags when day changes.
     checkDailyReset();
-
-    // 经验限制状态（移到有操作时才显示）
 
     try {
         const friendsReply = await getAllFriends();
         const friends = friendsReply.game_friends || [];
-        if (friends.length === 0) { log('好友', '没有好友'); return; }
+        friendLoopTimeoutBackoffMs = 0;
 
-        // 检查帮助经验是否还有
-        const canHelpWithExp = !HELP_ONLY_WITH_EXP || canGetExp(10005) || canGetExp(10006) || canGetExp(10007);
-        // 检查是否还有捣乱次数 (放虫/放草)
-        const canPutBugOrWeed = canOperate(10004) || canOperate(10003);  // 10004=放虫, 10003=放草
+        writeWebuiFriendsSnapshot(friends, toNum(state.gid));
+        syncFriendStatsFromOfficialList(friends, toNum(state.gid));
+        maybeQueueAutoDeleteNoStealFriends(friends, toNum(state.gid));
+        if (friends.length === 0) {
+            friendNoActionStreak += 1;
+            log('FRIEND', '好友列表为空，本轮跳过');
+            return false;
+        }
 
-        // 分两类：有预览信息的优先访问，其他的放后面（用于放虫放草）
-        const priorityFriends = [];  // 有可偷/可帮助的好友
-        const otherFriends = [];     // 其他好友（仅用于放虫放草）
+        const helpFeatureEnabled = friendActionCare;
+        const canHelpWithExp = helpFeatureEnabled
+            && (!HELP_ONLY_WITH_EXP || canGetExp(10005) || canGetExp(10006) || canGetExp(10007));
+        const betweenFriendDelayMs = Math.max(0, Math.floor(Number(friendBetweenFriendDelayMs) || 0));
+        const canPutBugOrWeed = canOperate(10004) || canOperate(10003);
+
+        // Always process steal first, then help, then prank-only targets.
+        const stealFriends = [];
+        const helpFriends = [];
+        const otherFriends = [];
+        const prankDiagEnabled = friendActionPrank && ENABLE_PUT_BAD_THINGS;
+        const prankBugRemainAtCycleStart = canOperate(10004) ? getRemainingTimes(10004) : 0;
+        const prankWeedRemainAtCycleStart = canOperate(10003) ? getRemainingTimes(10003) : 0;
+        if (prankDiagEnabled) {
+            log('PRANK', `本轮开始：可放虫=${prankBugRemainAtCycleStart}，可放草=${prankWeedRemainAtCycleStart}，开关=${canPutBugOrWeed ? '开' : '关'}`);
+        }
+
         const visitedGids = new Set();
-        
         for (const f of friends) {
             const gid = toNum(f.gid);
-            if (gid === state.gid) continue;
-            if (visitedGids.has(gid)) continue;
-            const name = f.remark || f.name || `GID:${gid}`;
+            if (gid === state.gid || visitedGids.has(gid)) continue;
+
+            const name = normalizeRuntimeText(f.remark || f.name || `GID:${gid}`).slice(0, 48) || `GID:${gid}`;
+            const stealEnabled = isFriendStealEnabled({ gid, name });
             const p = f.plant;
 
             const stealNum = p ? toNum(p.steal_plant_num) : 0;
@@ -549,99 +1303,146 @@ async function checkFriends() {
             const weedNum = p ? toNum(p.weed_num) : 0;
             const insectNum = p ? toNum(p.insect_num) : 0;
 
-            const hasSteal = stealNum > 0;
-            const hasHelp = dryNum > 0 || weedNum > 0 || insectNum > 0;
+            const hasSteal = friendActionSteal && stealEnabled && stealNum > 0;
+            const hasHelp = friendActionCare && (dryNum > 0 || weedNum > 0 || insectNum > 0);
 
-            // 调试：显示指定好友的预览信息
             const showDebug = DEBUG_FRIEND_LANDS === true || DEBUG_FRIEND_LANDS === name;
             if (showDebug) {
-                console.log(`[调试] 好友列表预览 [${name}]: steal=${stealNum} dry=${dryNum} weed=${weedNum} insect=${insectNum}`);
+                console.log(`[DEBUG] friend preview [${name}]: steal=${stealNum} dry=${dryNum} weed=${weedNum} insect=${insectNum}`);
             }
 
             if (hasSteal) {
-                // 有可偷的，始终加入
-                priorityFriends.push({ gid, name, level: toNum(f.level), hasSteal: true, hasHelp });
+                stealFriends.push({ gid, name, level: toNum(f.level), hasSteal: true, hasHelp, stealEnabled });
                 visitedGids.add(gid);
             } else if (hasHelp && canHelpWithExp) {
-                // 只有帮助项且还能获得经验时才加入
-                priorityFriends.push({ gid, name, level: toNum(f.level), hasSteal: false, hasHelp: true });
+                helpFriends.push({ gid, name, level: toNum(f.level), hasSteal: false, hasHelp: true, stealEnabled });
                 visitedGids.add(gid);
-            } else if (ENABLE_PUT_BAD_THINGS && canPutBugOrWeed) {
-                // 没有预览信息但可以放虫放草（仅在开启放虫放草功能时）
-                otherFriends.push({ gid, name, level: toNum(f.level), hasSteal: false, hasHelp: false });
+            } else if (friendActionPrank && ENABLE_PUT_BAD_THINGS && canPutBugOrWeed) {
+                otherFriends.push({ gid, name, level: toNum(f.level), hasSteal: false, hasHelp: false, stealEnabled });
                 visitedGids.add(gid);
             }
 
             if (showDebug && visitedGids.has(gid)) {
-                console.log(`[调试] 好友 [${name}] 加入列表 (位置: ${priorityFriends.length})`);
+                const pos = stealFriends.length + helpFriends.length + otherFriends.length;
+                console.log(`[DEBUG] friend [${name}] queued at ${pos}`);
             }
         }
-        
-        // 合并列表：优先好友在前
-        const friendsToVisit = [...priorityFriends, ...otherFriends];
-        
-        // 调试：检查目标好友位置
+
+        const friendsToVisit = [...stealFriends, ...helpFriends, ...otherFriends];
+        if (prankDiagEnabled) {
+            log('PRANK', `队列统计：偷菜=${stealFriends.length}，照顾=${helpFriends.length}，仅捣乱=${otherFriends.length}，合计=${friendsToVisit.length}`);
+        }
+
         if (DEBUG_FRIEND_LANDS && typeof DEBUG_FRIEND_LANDS === 'string') {
-            const idx = friendsToVisit.findIndex(f => f.name === DEBUG_FRIEND_LANDS);
+            const idx = friendsToVisit.findIndex((f) => f.name === DEBUG_FRIEND_LANDS);
             if (idx >= 0) {
-                const inPriority = idx < priorityFriends.length;
-                console.log(`[调试] 好友 [${DEBUG_FRIEND_LANDS}] 位置: ${idx + 1}/${friendsToVisit.length} (${inPriority ? '优先列表' : '其他列表'})`);
+                const inSteal = idx < stealFriends.length;
+                const inHelp = !inSteal && idx < (stealFriends.length + helpFriends.length);
+                const group = inSteal ? 'steal' : (inHelp ? 'help' : 'other');
+                console.log(`[DEBUG] friend [${DEBUG_FRIEND_LANDS}] index ${idx + 1}/${friendsToVisit.length} (${group})`);
             } else {
-                console.log(`[调试] 好友 [${DEBUG_FRIEND_LANDS}] 不在待访问列表中!`);
+                console.log(`[DEBUG] friend [${DEBUG_FRIEND_LANDS}] not in visit list`);
             }
         }
 
-        if (friendsToVisit.length === 0) {
-            // 无需操作时不输出日志
-            return;
+        const totalFriendCount = friends.length;
+        const queuedFriendCount = friendsToVisit.length;
+
+        if (queuedFriendCount === 0) {
+            friendNoActionStreak += 1;
+            if (prankDiagEnabled) log('PRANK', '本轮结束：无可访问好友');
+            return false;
         }
 
-        let totalActions = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
+        const totalActions = { steal: 0, water: 0, weed: 0, bug: 0, putBug: 0, putWeed: 0 };
         for (let i = 0; i < friendsToVisit.length; i++) {
             const friend = friendsToVisit[i];
+            if (!friendActionPrank && !friend.hasSteal && !friend.hasHelp) continue;
+
             const showDebug = DEBUG_FRIEND_LANDS === true || DEBUG_FRIEND_LANDS === friend.name;
             if (showDebug) {
-                console.log(`[调试] 准备访问 [${friend.name}] (${i + 1}/${friendsToVisit.length})`);
+                console.log(`[DEBUG] visiting [${friend.name}] (${i + 1}/${friendsToVisit.length})`);
             }
-            try { 
-                await visitFriend(friend, totalActions, state.gid); 
-            } catch (e) { 
-                if (showDebug) {
-                    console.log(`[调试] 访问 [${friend.name}] 出错: ${e.message}`);
-                }
+
+            try {
+                await visitFriend(friend, totalActions, state.gid);
+            } catch (e) {
+                if (showDebug) console.log(`[DEBUG] visit error [${friend.name}]: ${e.message}`);
             }
-            await sleep(500);
-            // 如果捣乱次数用完了，且没有其他操作，可以提前结束
-            if (!canOperate(10004) && !canOperate(10003)) {  // 10004=放虫, 10003=放草
-                // 继续巡查，但不再放虫放草
+
+            if (betweenFriendDelayMs > 0) {
+                await sleep(betweenFriendDelayMs);
             }
         }
 
-        // 只在有操作时输出日志
         const summary = [];
-        if (totalActions.steal > 0) summary.push(`偷${totalActions.steal}`);
-        if (totalActions.weed > 0) summary.push(`除草${totalActions.weed}`);
-        if (totalActions.bug > 0) summary.push(`除虫${totalActions.bug}`);
-        if (totalActions.water > 0) summary.push(`浇水${totalActions.water}`);
-        if (totalActions.putBug > 0) summary.push(`放虫${totalActions.putBug}`);
-        if (totalActions.putWeed > 0) summary.push(`放草${totalActions.putWeed}`);
-        
-        if (summary.length > 0) {
-            log('好友', `巡查 ${friendsToVisit.length} 人 → ${summary.join('/')}`);
+        if (totalActions.steal > 0) summary.push(`偷菜${totalActions.steal}`);
+        const careTotal = totalActions.weed + totalActions.bug + totalActions.water;
+        if (careTotal > 0) {
+            const careParts = [];
+            if (totalActions.water > 0) careParts.push(`浇水${totalActions.water}`);
+            if (totalActions.weed > 0) careParts.push(`除草${totalActions.weed}`);
+            if (totalActions.bug > 0) careParts.push(`除虫${totalActions.bug}`);
+            summary.push(`照顾${careTotal}${careParts.length ? `(${careParts.join('/')})` : ''}`);
         }
+
+        const prankTotal = totalActions.putBug + totalActions.putWeed;
+        if (prankTotal > 0) {
+            const prankParts = [];
+            if (totalActions.putBug > 0) prankParts.push(`放虫${totalActions.putBug}`);
+            if (totalActions.putWeed > 0) prankParts.push(`放草${totalActions.putWeed}`);
+            summary.push(`捣乱${prankTotal}${prankParts.length ? `(${prankParts.join('/')})` : ''}`);
+        }
+
+        if (summary.length > 0) {
+            friendNoActionStreak = 0;
+            log('FRIEND', `巡查队列${queuedFriendCount}/${totalFriendCount}位好友：${summary.join('，')}`);
+        } else {
+            friendNoActionStreak += 1;
+        }
+        if (prankDiagEnabled) {
+            const prankBugRemainAtCycleEnd = canOperate(10004) ? getRemainingTimes(10004) : 0;
+            const prankWeedRemainAtCycleEnd = canOperate(10003) ? getRemainingTimes(10003) : 0;
+            const prankSuccessTotal = totalActions.putBug + totalActions.putWeed;
+            if (prankSuccessTotal > 0) {
+                log('PRANK', `本轮结束：捣乱${prankSuccessTotal}（放虫${totalActions.putBug}/放草${totalActions.putWeed}），剩余放虫=${prankBugRemainAtCycleEnd}，剩余放草=${prankWeedRemainAtCycleEnd}`);
+            } else {
+                log('PRANK', `本轮结束：未执行捣乱，剩余放虫=${prankBugRemainAtCycleEnd}，剩余放草=${prankWeedRemainAtCycleEnd}`);
+            }
+        }
+
         isFirstFriendCheck = false;
+        friendLoopTimeoutBackoffMs = 0;
     } catch (err) {
-        logWarn('好友', `巡查失败: ${err.message}`);
+        friendNoActionStreak = 0;
+        const msg = normalizeRuntimeText((err && err.message) || err || '');
+        checkTimedOut = /请求超时|request timeout|timeout/i.test(msg);
+        if (checkTimedOut) {
+            friendLoopTimeoutBackoffMs = friendLoopTimeoutBackoffMs > 0
+                ? Math.min(friendLoopTimeoutBackoffMs * 2, LOOP_TIMEOUT_BACKOFF_MAX_MS)
+                : LOOP_TIMEOUT_BACKOFF_BASE_MS;
+            logWarn('FRIEND', `巡查失败：${msg}（临时退避 ${friendLoopTimeoutBackoffMs}ms）`);
+        } else {
+            friendLoopTimeoutBackoffMs = 0;
+            logWarn('FRIEND', `巡查失败：${msg}`);
+        }
     } finally {
+        flushFriendStatsIfDirty();
         isCheckingFriends = false;
     }
+    return checkTimedOut;
 }
 
 /**
- * 判断当前时间是否在好友巡查生效时段内
- * 支持跨午夜（start > end 时，如 22:00-06:00）
+
+
  */
 function isInFriendActiveWindow(start, end) {
+    return isInTimeWindow(start, end, friendActiveAllDay);
+}
+
+function isInTimeWindow(start, end, allDayFlag = false) {
+    if (allDayFlag) return true;
     if (!start || !end) return false;
     const now = new Date();
     const nowMin = now.getHours() * 60 + now.getMinutes();
@@ -649,20 +1450,32 @@ function isInFriendActiveWindow(start, end) {
     const [eh, em] = end.split(':').map(Number);
     const startMin = sh * 60 + sm;
     const endMin = eh * 60 + em;
+    if (startMin === endMin) return true;
     if (startMin <= endMin) {
         return nowMin >= startMin && nowMin < endMin;
     }
-    // 跨午夜：startMin > endMin
+
     return nowMin >= startMin || nowMin < endMin;
 }
 
 /**
- * 好友巡查循环 - 本次完成后等待指定秒数再开始下次
+
  */
 function normalizeIntervalSec(value, fallbackSec) {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallbackSec;
-    return Math.min(Math.max(Math.floor(n), 1), 300);
+    return Math.min(Math.max(Math.floor(n), 0), 300);
+}
+
+function normalizePerformanceMode(value) {
+    const key = String(value || '').trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(FRIEND_PERFORMANCE_PROFILES, key)) return key;
+    return 'standard';
+}
+
+function getPerformanceProfile(mode) {
+    const key = normalizePerformanceMode(mode);
+    return FRIEND_PERFORMANCE_PROFILES[key] || FRIEND_PERFORMANCE_PROFILES.standard;
 }
 
 function readWebuiConfig() {
@@ -681,46 +1494,260 @@ function readWebuiConfig() {
     }
 }
 
+function writeWebuiConfigPatch(patch = {}) {
+    try {
+        const current = readWebuiConfig() || {};
+        const next = { ...current, ...patch };
+        const dir = path.dirname(WEBUI_CONFIG_PATH);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(WEBUI_CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+        try {
+            const stat = fs.statSync(WEBUI_CONFIG_PATH);
+            webuiConfigMtimeMs = stat.mtimeMs;
+        } catch (e) {
+            webuiConfigMtimeMs = -1;
+        }
+        webuiConfigCache = next;
+        return next;
+    } catch (err) {
+        logWarn('CONFIG', `write webui config failed: ${normalizeRuntimeText(err.message)}`);
+        return null;
+    }
+}
+
+function isCareExpFullyExhausted() {
+    return !canGetExp(10005) && !canGetExp(10006) && !canGetExp(10007);
+}
+
+function maybeAutoDisableFriendCare() {
+    if (!HELP_ONLY_WITH_EXP) return;
+    if (!friendActionCare) return;
+    if (!isCareExpFullyExhausted()) return;
+
+    const updated = writeWebuiConfigPatch({ friendActionCare: false });
+    if (!updated) return;
+
+    friendActionCare = false;
+    log('CONFIG', '照顾已自动关闭（经验次数已用尽）');
+}
+
+function maybeAutoDisableFriendPrankOnFailure(reason = '', errMsg = '') {
+    if (!friendActionPrank) return false;
+
+    const updated = writeWebuiConfigPatch({ friendActionPrank: false });
+    friendActionPrank = false;
+    if (!updated) {
+        logWarn('CONFIG', '自动关闭捣乱写配置失败，仅本次运行已关闭');
+    }
+    const detail = [
+        reason ? `reason=${reason}` : '',
+        errMsg ? `error=${String(errMsg).replace(/\s+/g, ' ').slice(0, 180)}` : '',
+    ].filter(Boolean).join(' ');
+    log('CONFIG', `捣乱已自动关闭（执行失败）${detail ? ` ${detail}` : ''}`);
+    return true;
+}
+
 function applyRuntimeFriendConfig() {
     const cfg = readWebuiConfig();
     if (!cfg) return;
+    const toBool = (value, fallback) => {
+        if (value === undefined || value === null || value === '') return fallback;
+        const text = String(value).trim().toLowerCase();
+        if (['1', 'true', 'yes', 'on'].includes(text)) return true;
+        if (['0', 'false', 'no', 'off'].includes(text)) return false;
+        return fallback;
+    };
 
-    if (Object.prototype.hasOwnProperty.call(cfg, 'friendIntervalSec')) {
-        const currentSec = Math.max(1, Math.floor(CONFIG.friendCheckInterval / 1000));
-        const nextSec = normalizeIntervalSec(cfg.friendIntervalSec, currentSec);
-        const nextMs = nextSec * 1000;
-        if (nextMs !== CONFIG.friendCheckInterval) {
-            CONFIG.friendCheckInterval = nextMs;
-            log('CONFIG', `friend interval hot-updated to ${nextSec}s`);
-        }
+    const nextPerformanceMode = normalizePerformanceMode(cfg.performanceMode);
+    const performanceProfile = getPerformanceProfile(nextPerformanceMode);
+    const profileIntervalFallbackSec = normalizeIntervalSec(performanceProfile.friendIntervalSec, 1);
+    const nextSec = normalizeIntervalSec(cfg.friendIntervalSec, profileIntervalFallbackSec);
+    const nextMs = nextSec * 1000;
+    if (nextMs !== CONFIG.friendCheckInterval) {
+        CONFIG.friendCheckInterval = nextMs;
+        log('CONFIG', `好友巡查间隔热更新为 ${nextSec}s`);
     }
 
     const normalizeHHMM = (v) => (/^\d{2}:\d{2}$/.test(String(v || '').trim()) ? String(v).trim() : '');
-    friendActiveStart = normalizeHHMM(cfg.friendActiveStart);
-    friendActiveEnd = normalizeHHMM(cfg.friendActiveEnd);
+    const nextFriendActiveStart = normalizeHHMM(cfg.friendActiveStart);
+    const nextFriendActiveEnd = normalizeHHMM(cfg.friendActiveEnd);
+    const nextFriendActiveAllDay = toBool(cfg.friendActiveAllDay, false);
+    const nextFriendApplyActiveStart = normalizeHHMM(cfg.friendApplyActiveStart);
+    const nextFriendApplyActiveEnd = normalizeHHMM(cfg.friendApplyActiveEnd);
+    const nextFriendApplyAllDay = toBool(cfg.friendApplyAllDay, true);
+    const nextFriendActionSteal = toBool(cfg.friendActionSteal, true);
+    const legacyCare = toBool(cfg.friendActionWater, true)
+        || toBool(cfg.friendActionWeed, true)
+        || toBool(cfg.friendActionBug, true);
+    const nextFriendActionCare = toBool(cfg.friendActionCare, legacyCare);
+    const nextFriendActionPrank = toBool(cfg.friendActionPrank, false);
+    const nextFriendStealEnabledMap = normalizeFriendStealEnabled(cfg.friendStealEnabled);
+    const nextFriendStealEnabledSig = JSON.stringify(nextFriendStealEnabledMap);
+    const nextStealLevelThreshold = Math.max(0, Math.floor(Number(cfg.stealLevelThreshold) || 0));
+    const nextFriendAutoDeleteNoStealEnabled = toBool(cfg.friendAutoDeleteNoStealEnabled, false);
+    const nextFriendAutoDeleteNoStealDays = Math.max(1, Math.floor(Number(cfg.friendAutoDeleteNoStealDays) || 7));
+    const nextFriendActionDelayMs = Math.max(0, Math.floor(Number(performanceProfile.actionDelayMs) || 0));
+    const nextFriendBetweenFriendDelayMs = Math.max(0, Math.floor(Number(performanceProfile.betweenFriendDelayMs) || 0));
+    const staleDeleteRequestIds = [];
+    const activeDeleteRequests = [];
+    for (const item of normalizeFriendDeleteRequests(cfg.friendDeleteRequests)) {
+        if (shouldIgnoreStaleFriendRequest(item.requestedAtMs)) {
+            const ageSec = Math.max(0, Math.floor((Date.now() - item.requestedAtMs) / 1000));
+            log('CONFIG', `ignore stale friend-delete request gid=${item.gid} (${ageSec}s old)`);
+            staleDeleteRequestIds.push(item.requestId);
+            continue;
+        }
+        activeDeleteRequests.push(item);
+    }
+
+    if (
+        friendActiveStart !== nextFriendActiveStart
+        || friendActiveEnd !== nextFriendActiveEnd
+        || friendActiveAllDay !== nextFriendActiveAllDay
+    ) {
+        const nextWindowText = nextFriendActiveAllDay
+            ? 'all-day'
+            : (nextFriendActiveStart && nextFriendActiveEnd ? `${nextFriendActiveStart}-${nextFriendActiveEnd}` : 'disabled');
+        log('CONFIG', `好友巡查时段热更新为 ${nextWindowText}`);
+    }
+    if (
+        friendApplyActiveStart !== nextFriendApplyActiveStart
+        || friendApplyActiveEnd !== nextFriendApplyActiveEnd
+        || friendApplyAllDay !== nextFriendApplyAllDay
+    ) {
+        const nextApplyWindowText = nextFriendApplyAllDay
+            ? 'all-day'
+            : (nextFriendApplyActiveStart && nextFriendApplyActiveEnd ? `${nextFriendApplyActiveStart}-${nextFriendApplyActiveEnd}` : 'disabled');
+        log('CONFIG', `好友申请处理时段热更新为 ${nextApplyWindowText}`);
+    }
+    if (friendActionSteal !== nextFriendActionSteal) {
+        log('CONFIG', `偷菜开关热更新为 ${nextFriendActionSteal ? '开' : '关'}`);
+    }
+    if (friendActionCare !== nextFriendActionCare) {
+        log('CONFIG', `照顾开关热更新为 ${nextFriendActionCare ? '开' : '关'}`);
+    }
+    if (friendActionPrank !== nextFriendActionPrank) {
+        log('CONFIG', `捣乱开关热更新为 ${nextFriendActionPrank ? '开' : '关'}`);
+    }
+    if (friendStealLevelThreshold !== nextStealLevelThreshold) {
+        log('CONFIG', `偷菜等级阈值热更新为 >${nextStealLevelThreshold}`);
+    }
+    if (
+        friendAutoDeleteNoStealEnabled !== nextFriendAutoDeleteNoStealEnabled
+        || friendAutoDeleteNoStealDays !== nextFriendAutoDeleteNoStealDays
+    ) {
+        log(
+            'CONFIG',
+            `连续偷不到自动删热更新为 ${nextFriendAutoDeleteNoStealEnabled ? `开(${nextFriendAutoDeleteNoStealDays}天)` : '关'}`
+        );
+        lastFriendAutoDeleteNoStealSweepAt = 0;
+    }
+    if (friendStealEnabledMapSig !== nextFriendStealEnabledSig) {
+        log('CONFIG', '好友偷菜目标开关已热更新');
+    }
+    if (
+        friendPerformanceMode !== nextPerformanceMode
+        || friendActionDelayMs !== nextFriendActionDelayMs
+        || friendBetweenFriendDelayMs !== nextFriendBetweenFriendDelayMs
+    ) {
+        const modeName = nextPerformanceMode === 'retire'
+            ? '休养生息'
+            : (nextPerformanceMode === 'berserk' ? '不当人喽' : '中规中矩');
+        log(
+            'CONFIG',
+            `好友巡查模式热更新：${modeName}（巡查${nextSec}s / 操作等待${nextFriendActionDelayMs}ms / 好友切换等待${nextFriendBetweenFriendDelayMs}ms）`
+        );
+        friendNoActionStreak = 0;
+    }
+
+    const addedDeleteRequests = enqueueFriendDeleteRequests(activeDeleteRequests);
+    if (addedDeleteRequests.length > 0) {
+        const names = addedDeleteRequests
+            .map((item) => normalizeRuntimeText(item.name || `GID:${item.gid}`).slice(0, 24) || `GID:${item.gid}`)
+            .join(', ');
+        log('FRIEND_DELETE', `收到 ${addedDeleteRequests.length} 条删好友请求：${names}`);
+    }
+    if (staleDeleteRequestIds.length > 0) {
+        removeFriendDeleteRequestsFromConfig(staleDeleteRequestIds);
+    }
+
+    friendActiveStart = nextFriendActiveStart;
+    friendActiveEnd = nextFriendActiveEnd;
+    friendActiveAllDay = nextFriendActiveAllDay;
+    friendApplyActiveStart = nextFriendApplyActiveStart;
+    friendApplyActiveEnd = nextFriendApplyActiveEnd;
+    friendApplyAllDay = nextFriendApplyAllDay;
+    friendActionSteal = nextFriendActionSteal;
+    friendActionCare = nextFriendActionCare;
+    friendActionPrank = nextFriendActionPrank;
+    friendStealEnabledMap = nextFriendStealEnabledMap;
+    friendStealEnabledMapSig = nextFriendStealEnabledSig;
+    friendStealLevelThreshold = nextStealLevelThreshold;
+    friendAutoDeleteNoStealEnabled = nextFriendAutoDeleteNoStealEnabled;
+    friendAutoDeleteNoStealDays = nextFriendAutoDeleteNoStealDays;
+    friendPerformanceMode = nextPerformanceMode;
+    friendActionDelayMs = nextFriendActionDelayMs;
+    friendBetweenFriendDelayMs = nextFriendBetweenFriendDelayMs;
+}
+
+function getBerserkIdleExtraWaitMs() {
+    if (friendPerformanceMode !== 'berserk') return 0;
+
+    if (friendNoActionStreak >= 48) return 1300;
+    if (friendNoActionStreak >= 28) return 900;
+    if (friendNoActionStreak >= 14) return 520;
+    if (friendNoActionStreak >= 6) return 280;
+    return 0;
 }
 
 async function friendCheckLoop() {
     while (friendLoopRunning) {
         applyRuntimeFriendConfig();
+        maybeAutoEnableDailyFriendActions();
+        await processPendingFriendDeleteRequests();
+        await processPendingFriendApplications();
 
         if (!isInFriendActiveWindow(friendActiveStart, friendActiveEnd)) {
             if (Date.now() - lastWindowSkipLogAt >= 10 * 60 * 1000) {
                 const reason = (!friendActiveStart || !friendActiveEnd)
-                    ? '未配置好友巡查时段，跳过本次巡查'
-                    : `当前不在好友巡查时段（${friendActiveStart}–${friendActiveEnd}），跳过本次巡查`;
-                log('好友', reason);
+                    ? '未配置好友巡查时段，跳过本轮'
+                    : `当前时间不在好友巡查时段（${friendActiveStart}-${friendActiveEnd}），跳过本轮`;
+                log('CONFIG', reason);
                 lastWindowSkipLogAt = Date.now();
             }
             if (!friendLoopRunning) break;
-            await sleep(CONFIG.friendCheckInterval);
+            const minLoopWaitMs = friendPerformanceMode === 'berserk' ? BERSERK_MIN_LOOP_WAIT_MS : 0;
+            const idleExtraWaitMs = getBerserkIdleExtraWaitMs();
+            const networkGuardWaitMs = getFriendNetworkGuardWaitMs();
+            const waitMs = Math.max(
+                Number(CONFIG.friendCheckInterval) || 0,
+                friendLoopTimeoutBackoffMs,
+                minLoopWaitMs,
+                idleExtraWaitMs,
+                networkGuardWaitMs
+            );
+            if (waitMs > 0) {
+                await sleep(waitMs);
+            }
             continue;
         }
 
         lastWindowSkipLogAt = 0;
         await checkFriends();
         if (!friendLoopRunning) break;
-        await sleep(CONFIG.friendCheckInterval);
+        const minLoopWaitMs = friendPerformanceMode === 'berserk' ? BERSERK_MIN_LOOP_WAIT_MS : 0;
+        const idleExtraWaitMs = getBerserkIdleExtraWaitMs();
+        const networkGuardWaitMs = getFriendNetworkGuardWaitMs();
+        const waitMs = Math.max(
+            Number(CONFIG.friendCheckInterval) || 0,
+            friendLoopTimeoutBackoffMs,
+            minLoopWaitMs,
+            idleExtraWaitMs,
+            networkGuardWaitMs
+        );
+        if (waitMs > 0) {
+            await sleep(waitMs);
+        }
     }
 }
 
@@ -728,16 +1755,16 @@ function startFriendCheckLoop() {
     if (friendLoopRunning) return;
     friendLoopRunning = true;
 
-    // 注册操作限制更新回调，从农场检查中获取限制信息
+
     setOperationLimitsCallback(updateOperationLimits);
 
-    // 监听好友申请推送 (微信同玩)
+
     networkEvents.on('friendApplicationReceived', onFriendApplicationReceived);
 
-    // 延迟 5 秒后启动循环，等待登录和首次农场检查完成
+
     friendCheckTimer = setTimeout(() => friendCheckLoop(), 5000);
 
-    // 启动时检查一次待处理的好友申请
+
     setTimeout(() => checkAndAcceptApplications(), 3000);
 }
 
@@ -747,23 +1774,133 @@ function stopFriendCheckLoop() {
     if (friendCheckTimer) { clearTimeout(friendCheckTimer); friendCheckTimer = null; }
 }
 
-// ============ 自动同意好友申请 (微信同玩) ============
+
 
 /**
- * 处理服务器推送的好友申请
+
  */
 function onFriendApplicationReceived(applications) {
-    const names = applications.map(a => a.name || `GID:${toNum(a.gid)}`).join(', ');
-    log('申请', `收到 ${applications.length} 个好友申请: ${names}`);
-
-    // 自动同意
-    const gids = applications.map(a => toNum(a.gid));
-    acceptFriendsWithRetry(gids);
+    const rows = Array.isArray(applications) ? applications : [];
+    const names = rows.map(a => a.name || `GID:${toNum(a.gid)}`).join(', ');
+    if (rows.length > 0) {
+        log('FRIEND_APPLY', `收到 ${rows.length} 条好友申请：${names}`);
+    }
+    enqueueFriendApplications(rows);
+    void processPendingFriendApplications();
 }
 
-/**
- * 检查并同意所有待处理的好友申请
- */
+function enqueueFriendApplications(applications) {
+    const rows = Array.isArray(applications) ? applications : [];
+    for (const app of rows) {
+        const gid = toNum(app && app.gid);
+        if (!gid) continue;
+        const name = String(app && app.name || app && app.remark || `GID:${gid}`).trim() || `GID:${gid}`;
+        pendingFriendApplications.set(gid, name);
+    }
+}
+
+async function processPendingFriendDeleteRequests() {
+    if (pendingFriendDeleteRequests.length <= 0) return;
+    if (isProcessingPendingFriendDeleteRequests) return;
+
+    isProcessingPendingFriendDeleteRequests = true;
+    const completedRequestIds = [];
+    let deletedCount = 0;
+
+    try {
+        while (pendingFriendDeleteRequests.length > 0) {
+            const request = pendingFriendDeleteRequests[0];
+            const gid = toNum(request && request.gid);
+            const safeName = normalizeRuntimeText(request && request.name ? request.name : `GID:${gid}`).slice(0, 48) || `GID:${gid}`;
+            if (gid <= 0) {
+                completedRequestIds.push(String(request && request.requestId || '').trim());
+                pendingFriendDeleteRequests.shift();
+                continue;
+            }
+
+            try {
+                await deleteFriend(gid);
+                pendingFriendApplications.delete(gid);
+                pendingFriendDeleteRequests.shift();
+                completedRequestIds.push(String(request.requestId || '').trim());
+                deletedCount += 1;
+                log('FRIEND_DELETE', `已删除好友：${safeName} (GID:${gid})`);
+            } catch (e) {
+                logWarn('FRIEND_DELETE', `删除好友失败：${safeName} (GID:${gid}) ${normalizeRuntimeText((e && e.message) || String(e))}`);
+                break;
+            }
+        }
+    } finally {
+        isProcessingPendingFriendDeleteRequests = false;
+    }
+
+    if (completedRequestIds.length > 0) {
+        removeFriendDeleteRequestsFromConfig(completedRequestIds);
+    }
+
+    if (deletedCount > 0) {
+        try {
+            const state = getUserState();
+            const myGid = toNum(state && state.gid);
+            const friendsReply = await getAllFriends();
+            const friends = Array.isArray(friendsReply && friendsReply.game_friends) ? friendsReply.game_friends : [];
+            writeWebuiFriendsSnapshot(friends, myGid);
+            syncFriendStatsFromOfficialList(friends, myGid);
+            flushFriendStatsIfDirty();
+        } catch (e) {
+            logWarn('FRIEND_DELETE', `删除后刷新好友快照失败：${normalizeRuntimeText((e && e.message) || String(e))}`);
+        }
+    }
+}
+
+async function processPendingFriendApplications() {
+    if (pendingFriendApplications.size <= 0) return;
+    if (isProcessingPendingFriendApplications) return;
+    isProcessingPendingFriendApplications = true;
+    try {
+        if (!isInTimeWindow(friendApplyActiveStart, friendApplyActiveEnd, friendApplyAllDay)) {
+            if (Date.now() - lastApplyWindowSkipLogAt >= 10 * 60 * 1000) {
+                const windowText = friendApplyAllDay
+                    ? 'all-day'
+                    : (friendApplyActiveStart && friendApplyActiveEnd ? `${friendApplyActiveStart}-${friendApplyActiveEnd}` : 'disabled');
+                log('CONFIG', `好友申请处理时段未生效（${windowText}），当前待处理=${pendingFriendApplications.size}`);
+                lastApplyWindowSkipLogAt = Date.now();
+            }
+            return;
+        }
+
+        lastApplyWindowSkipLogAt = 0;
+        const queuedGids = Array.from(pendingFriendApplications.keys());
+        if (queuedGids.length <= 0) return;
+
+        const { currentCount, remainingSlots } = await getFriendCapacityInfo();
+        if (remainingSlots <= 0) {
+            if (Date.now() - lastFriendApplyFullLogAt >= 10 * 60 * 1000) {
+                log('FRIEND_APPLY', `好友位已满（${currentCount}/${FRIEND_MAX_COUNT}），暂停通过，待处理=${queuedGids.length}`);
+                lastFriendApplyFullLogAt = Date.now();
+            }
+            return;
+        }
+
+        lastFriendApplyFullLogAt = 0;
+        const gids = queuedGids.slice(0, remainingSlots);
+        if (gids.length <= 0) return;
+        if (gids.length < queuedGids.length) {
+            log('FRIEND_APPLY', `好友位剩余 ${remainingSlots}/${FRIEND_MAX_COUNT}，本轮仅通过 ${gids.length}/${queuedGids.length} 条申请`);
+        }
+
+        const result = await acceptFriendsWithRetry(gids);
+        if (!result.ok) return;
+
+        const accepted = result.acceptedGids.length > 0 ? result.acceptedGids : gids;
+        for (const gid of accepted) {
+            pendingFriendApplications.delete(gid);
+        }
+    } finally {
+        isProcessingPendingFriendApplications = false;
+    }
+}
+
 async function checkAndAcceptApplications() {
     try {
         const reply = await getApplications();
@@ -771,29 +1908,32 @@ async function checkAndAcceptApplications() {
         if (applications.length === 0) return;
 
         const names = applications.map(a => a.name || `GID:${toNum(a.gid)}`).join(', ');
-        log('申请', `发现 ${applications.length} 个待处理申请: ${names}`);
+        log('FRIEND_APPLY', `拉取到 ${applications.length} 条好友申请：${names}`);
 
-        const gids = applications.map(a => toNum(a.gid));
-        await acceptFriendsWithRetry(gids);
+        enqueueFriendApplications(applications);
+        await processPendingFriendApplications();
     } catch (e) {
-        // 静默失败，可能是 QQ 平台不支持
+        // ignore and retry next cycle
     }
 }
-
-/**
- * 同意好友申请 (带重试)
- */
 async function acceptFriendsWithRetry(gids) {
-    if (gids.length === 0) return;
+    if (gids.length === 0) return { ok: true, acceptedGids: [] };
     try {
         const reply = await acceptFriends(gids);
         const friends = reply.friends || [];
+        let acceptedGids = [];
         if (friends.length > 0) {
             const names = friends.map(f => f.name || f.remark || `GID:${toNum(f.gid)}`).join(', ');
-            log('申请', `已同意 ${friends.length} 人: ${names}`);
+            log('FRIEND_APPLY', `已通过 ${friends.length} 条好友申请：${names}`);
+            acceptedGids = friends.map((f) => toNum(f.gid)).filter((gid) => gid > 0);
         }
+        if (acceptedGids.length <= 0) {
+            acceptedGids = gids.filter((gid) => toNum(gid) > 0).map((gid) => toNum(gid));
+        }
+        return { ok: true, acceptedGids };
     } catch (e) {
-        logWarn('申请', `同意失败: ${e.message}`);
+        logWarn('FRIEND_APPLY', `通过好友申请失败：${normalizeRuntimeText(e.message)}`);
+        return { ok: false, acceptedGids: [] };
     }
 }
 

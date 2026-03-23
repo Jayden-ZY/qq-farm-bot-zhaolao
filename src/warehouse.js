@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 仓库系统 - 自动出售果实
  * 协议说明：BagReply 使用 item_bag（ItemBag），item_bag.items 才是背包物品列表
  */
@@ -6,11 +6,14 @@
 const { types } = require('./proto');
 const { sendMsgAsync, getUserState } = require('./network');
 const { toLong, toNum, log, logWarn, sleep, emitRuntimeHint } = require('./utils');
-const { getFruitName, getPlantByFruitId, getLevelExpProgress } = require('./gameConfig');
+const { getFruitName, getPlantByFruitId, getLevelExpProgress, getItemInfoById, getItemName } = require('./gameConfig');
 const seedShopData = require('../tools/seed-shop-merged-export.json');
 
 // 游戏内金币和点券的物品 ID (GlobalData.GodItemId / DiamondItemId)
 const GOLD_ITEM_ID = 1001;
+const DIAMOND_ITEM_ID = 1002;
+const WAREHOUSE_SUPER_FRUIT_ID_OFFSET = 1000000;
+const WAREHOUSE_ITEM_TYPE_FRUIT = 6;
 
 // 单次 Sell 请求最多条数，过多可能触发 1000020 参数错误
 const SELL_BATCH_SIZE = 15;
@@ -24,12 +27,48 @@ const FRUIT_ID_SET = new Set(
 let sellTimer = null;
 let sellInterval = 60000;
 
+function getFruitBaseItemId(id) {
+    const safeId = toNum(id);
+    if (safeId <= 0) return 0;
+    if (safeId >= WAREHOUSE_SUPER_FRUIT_ID_OFFSET) {
+        const derived = safeId % WAREHOUSE_SUPER_FRUIT_ID_OFFSET;
+        if (derived > 0) return derived;
+    }
+    return safeId;
+}
+
+function getFruitItemInfo(id) {
+    const safeId = toNum(id);
+    if (safeId <= 0) return null;
+    const baseId = getFruitBaseItemId(safeId);
+    return getItemInfoById(safeId) || (baseId > 0 && baseId !== safeId ? getItemInfoById(baseId) : null);
+}
+
 function isFruitItemId(id) {
-    const n = toNum(id);
-    if (FRUIT_ID_SET.has(n)) return true;
-    // 兜底：种子类通常在 2xxxx，果实在 4xxxx
-    if (n < 40000) return false;
-    return !!getPlantByFruitId(n);
+    const safeId = toNum(id);
+    if (safeId <= 0) return false;
+
+    const baseId = getFruitBaseItemId(safeId);
+    const itemInfo = getFruitItemInfo(safeId);
+    const itemType = toNum(itemInfo && itemInfo.type);
+
+    if (itemType === WAREHOUSE_ITEM_TYPE_FRUIT) return true;
+    if (FRUIT_ID_SET.has(baseId)) return true;
+    if (baseId >= 40000 && baseId < 50000) return true;
+    return !!getPlantByFruitId(baseId);
+}
+
+function getSellItemLabel(id) {
+    const safeId = toNum(id);
+    const baseId = getFruitBaseItemId(safeId);
+    const fruitName = getFruitName(baseId);
+    const itemName = getItemName(baseId || safeId);
+    const resolvedName = (!/^果实\d+$/u.test(String(fruitName || '')) ? fruitName : itemName) || `果实${baseId || safeId}`;
+    const baseName = String(resolvedName).replace(/果实$/u, '').trim() || `果实${baseId || safeId}`;
+    if (safeId >= WAREHOUSE_SUPER_FRUIT_ID_OFFSET && baseId > 0 && baseId !== safeId) {
+        return `${baseName}(黄金)`;
+    }
+    return baseName;
 }
 
 /**
@@ -79,8 +118,9 @@ async function sellItems(items) {
  * 从 BagReply 取出物品列表（兼容 item_bag 与旧版 items）
  */
 function getBagItems(bagReply) {
-    if (bagReply.item_bag && bagReply.item_bag.items && bagReply.item_bag.items.length)
+    if (bagReply.item_bag && bagReply.item_bag.items && bagReply.item_bag.items.length) {
         return bagReply.item_bag.items;
+    }
     return bagReply.items || [];
 }
 
@@ -91,10 +131,19 @@ function getGoldFromItems(items) {
     return -1;
 }
 
+function getDiamondFromItems(items) {
+    for (const item of items) {
+        const id = toNum(item.id);
+        if (id === 2 || id === DIAMOND_ITEM_ID) return toNum(item.count);
+    }
+    return -1;
+}
+
 async function printTotalGold(prefetchedItems = null) {
     try {
         const items = prefetchedItems || getBagItems(await getBag());
         let gold = getGoldFromItems(items);
+        const diamond = getDiamondFromItems(items);
         if (gold < 0) {
             // 部分环境 Bag 不返回金币项，回退到内存态金币
             gold = toNum(getUserState().gold);
@@ -104,12 +153,13 @@ async function printTotalGold(prefetchedItems = null) {
             const level = toNum(state.level);
             const totalExp = toNum(state.exp);
             const progress = getLevelExpProgress(level, totalExp);
+            const pointText = diamond >= 0 ? ` | 点券 ${diamond}` : '';
 
             if (progress.needed > 0) {
                 const needToLevelUp = Math.max(0, progress.needed - progress.current);
-                log('仓库', `总金币 ${gold} | Lv${level} 经验 ${progress.current}/${progress.needed} (升级还需${needToLevelUp})`);
+                log('仓库', `总金币 ${gold}${pointText} | Lv${level} 经验 ${progress.current}/${progress.needed} (升级还需${needToLevelUp})`);
             } else {
-                log('仓库', `总金币 ${gold} | Lv${level}`);
+                log('仓库', `总金币 ${gold}${pointText} | Lv${level}`);
             }
         }
     } catch (e) {
@@ -139,7 +189,7 @@ async function sellAllFruits() {
             }
 
             toSell.push(item);
-            const name = getFruitName(id);
+            const name = getSellItemLabel(id);
             soldSummary.set(name, (soldSummary.get(name) || 0) + count);
         }
 
@@ -187,7 +237,7 @@ async function debugSellFruits() {
             const id = toNum(item.id);
             const count = toNum(item.count);
             if (isFruitItemId(id)) {
-                const name = getFruitName(id);
+                const name = getSellItemLabel(id);
                 log('仓库', `  [果实] ${name}(${id}) x${count}`);
             }
         }

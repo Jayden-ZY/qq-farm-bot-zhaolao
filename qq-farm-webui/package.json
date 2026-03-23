@@ -1,0 +1,19 @@
+{
+  "name": "qq-farm-webui",
+  "version": "1.0.0",
+  "description": "Web UI controller for qq-farm-bot",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "import-friends": "node tools/import-friends-from-log.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "nodemailer": "^8.0.1"
+  }
+}

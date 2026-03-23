@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>登录 — QQ 农场挂机控制台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;800&family=Noto+Serif+SC:wght@600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+        .login-wrap {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .login-card {
+            background: var(--bg-panel-strong);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--line);
+            padding: 44px 40px 40px;
+            width: 100%;
+            max-width: 400px;
+        }
+        .login-logo {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        .login-logo .eyebrow {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--brand);
+            margin: 0 0 8px;
+        }
+        .login-logo h1 {
+            font-family: var(--font-display);
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--text-main);
+            margin: 0;
+            line-height: 1.3;
+        }
+        .login-tabs {
+            display: flex;
+            gap: 4px;
+            background: rgba(31, 110, 165, 0.06);
+            border-radius: var(--radius-md);
+            padding: 4px;
+            margin-bottom: 28px;
+        }
+        .login-tab {
+            flex: 1;
+            padding: 8px;
+            border: none;
+            background: transparent;
+            border-radius: 9px;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--text-soft);
+            cursor: pointer;
+            transition: background 0.18s, color 0.18s;
+        }
+        .login-tab.active {
+            background: white;
+            color: var(--brand);
+            box-shadow: var(--shadow-sm);
+        }
+        .form-field {
+            margin-bottom: 16px;
+        }
+        .form-field label {
+            display: block;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-body);
+            margin-bottom: 6px;
+        }
+        .form-field input {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1.5px solid var(--line-strong);
+            border-radius: var(--radius-md);
+            font-size: 14px;
+            font-family: var(--font-ui);
+            color: var(--text-main);
+            background: white;
+            outline: none;
+            transition: border-color 0.18s, box-shadow 0.18s;
+        }
+        .form-field input:focus {
+            border-color: var(--brand);
+            box-shadow: 0 0 0 3px rgba(31, 110, 165, 0.12);
+        }
+        .form-hint {
+            font-size: 11.5px;
+            color: var(--text-soft);
+            margin-top: 5px;
+            line-height: 1.5;
+        }
+        .login-btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--brand);
+            color: white;
+            border: none;
+            border-radius: var(--radius-md);
+            font-size: 15px;
+            font-weight: 700;
+            font-family: var(--font-ui);
+            cursor: pointer;
+            margin-top: 8px;
+            transition: background 0.18s, transform 0.12s;
+        }
+        .login-btn:hover { background: var(--brand-strong); }
+        .login-btn:active { transform: scale(0.98); }
+        .login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .login-error {
+            background: rgba(178, 73, 60, 0.1);
+            border: 1px solid rgba(178, 73, 60, 0.3);
+            color: var(--danger);
+            border-radius: var(--radius-md);
+            padding: 10px 14px;
+            font-size: 13px;
+            margin-top: 14px;
+            display: none;
+        }
+        .login-error.visible { display: block; }
+    </style>
+</head>
+<body>
+    <div class="bg-shape bg-shape-1" aria-hidden="true"></div>
+    <div class="bg-shape bg-shape-2" aria-hidden="true"></div>
+
+    <div class="login-wrap">
+        <div class="login-card">
+            <div class="login-logo">
+                <p class="eyebrow">Farm Automation Control Center</p>
+                <h1>QQ 农场挂机控制台</h1>
+            </div>
+
+            <div class="login-tabs">
+                <button class="login-tab active" id="tabLogin" onclick="switchTab('login')">登录</button>
+                <button class="login-tab" id="tabRegister" onclick="switchTab('register')">注册账号</button>
+            </div>
+
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <div class="form-field">
+                    <label for="loginUsername">用户名</label>
+                    <input id="loginUsername" type="text" autocomplete="username" placeholder="输入用户名" required />
+                </div>
+                <div class="form-field">
+                    <label for="loginPassword">密码</label>
+                    <input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入密码" required />
+                </div>
+                <button class="login-btn" type="submit" id="loginBtn">登录</button>
+                <div class="login-error" id="loginError"></div>
+            </form>
+
+            <form id="registerForm" style="display:none" onsubmit="handleRegister(event)">
+                <div class="form-field">
+                    <label for="regUsername">用户名</label>
+                    <input id="regUsername" type="text" autocomplete="username" placeholder="2-32位，字母/数字/下划线" required />
+                    <p class="form-hint">只能包含英文字母、数字、下划线 (_) 和短横线 (-)，长度 2-32 位。</p>
+                </div>
+                <div class="form-field">
+                    <label for="regPassword">密码</label>
+                    <input id="regPassword" type="password" autocomplete="new-password" placeholder="至少 4 位" required />
+                </div>
+                <button class="login-btn" type="submit" id="registerBtn">创建账号</button>
+                <div class="login-error" id="registerError"></div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // If already logged in, redirect to home
+        fetch('/api/auth/me').then((r) => {
+            if (r.ok) window.location.href = '/';
+        }).catch(() => {});
+
+        // Hide register tab if registration is disabled
+        fetch('/api/auth/registration-status').then((r) => r.json()).then((data) => {
+            if (!data.registrationEnabled) {
+                document.getElementById('tabRegister').style.display = 'none';
+            }
+        }).catch(() => {});
+
+        function switchTab(tab) {
+            const isLogin = tab === 'login';
+            document.getElementById('tabLogin').classList.toggle('active', isLogin);
+            document.getElementById('tabRegister').classList.toggle('active', !isLogin);
+            document.getElementById('loginForm').style.display = isLogin ? '' : 'none';
+            document.getElementById('registerForm').style.display = isLogin ? 'none' : '';
+            document.getElementById('loginError').classList.remove('visible');
+            document.getElementById('registerError').classList.remove('visible');
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('loginBtn');
+            const errEl = document.getElementById('loginError');
+            errEl.classList.remove('visible');
+            btn.disabled = true;
+            btn.textContent = '登录中...';
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('loginUsername').value.trim(),
+                        password: document.getElementById('loginPassword').value,
+                    }),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    window.location.href = '/';
+                } else {
+                    errEl.textContent = data.error || '登录失败';
+                    errEl.classList.add('visible');
+                }
+            } catch (err) {
+                errEl.textContent = '网络错误，请重试';
+                errEl.classList.add('visible');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '登录';
+            }
+        }
+
+        async function handleRegister(e) {
+            e.preventDefault();
+            const btn = document.getElementById('registerBtn');
+            const errEl = document.getElementById('registerError');
+            errEl.classList.remove('visible');
+            btn.disabled = true;
+            btn.textContent = '注册中...';
+            try {
+                const res = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('regUsername').value.trim(),
+                        password: document.getElementById('regPassword').value,
+                    }),
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    window.location.href = '/';
+                } else {
+                    errEl.textContent = data.error || '注册失败';
+                    errEl.classList.add('visible');
+                }
+            } catch (err) {
+                errEl.textContent = '网络错误，请重试';
+                errEl.classList.add('visible');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '创建账号';
+            }
+        }
+    </script>
+</body>
+</html>

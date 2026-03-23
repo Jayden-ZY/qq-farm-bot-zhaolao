@@ -228,6 +228,21 @@ function getItemInfoById(itemId) {
 }
 
 /**
+ * 判断物品是否是可种植种子
+ * @param {number} itemId - 物品ID
+ */
+function isSeedItemId(itemId) {
+    const id = Number(itemId) || 0;
+    if (id <= 0) return false;
+    if (seedToPlant.has(id)) return true;
+    const itemInfo = getItemInfoById(id);
+    if (!itemInfo) return false;
+    const interactionType = String(itemInfo.interaction_type || '').trim().toLowerCase();
+    const itemType = Number(itemInfo.type) || 0;
+    return interactionType === 'plant' || itemType === 5;
+}
+
+/**
  * 根据物品ID获取名称（优先覆盖配置，再查 ItemInfo）
  * @param {number} itemId - 物品ID
  */
@@ -267,5 +282,7 @@ module.exports = {
     getFruitName,
     getPlantByFruitId,
     // 物品配置
+    getItemInfoById,
+    isSeedItemId,
     getItemName
 };

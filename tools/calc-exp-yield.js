@@ -2,11 +2,12 @@
  * 基于 tools/seed-shop-merged-export.json 计算经验收益率
  *
  * 规则：
- * 1) 每次收获经验 = exp（新版已去除铲地+1经验）
+ * 1) 每季收获经验按官方商店 exp 字段计算
  * 2) 种植速度：
  *    - 不施肥：2 秒种 18 块地 => 9 块/秒
  *    - 普通肥：2 秒种 12 块地 => 6 块/秒
- * 3) 普通肥：直接减少一个生长阶段（按 Plant.json 的 grow_phases 取首个非0阶段时长）
+ * 3) 普通肥：按当前 bot 行为，每次“整株生命周期”只减一次阶段时长
+ * 4) 多季作物：总经验=每季经验*季数；总生长=单季生长*季数
  *
  * 用法：
  *   node tools/calc-exp-yield.js
@@ -118,12 +119,6 @@ function loadSeedPhaseReduceMap() {
     return map;
 }
 
-function calcEffectiveGrowTime(growSec, seedId, seedPhaseReduceMap) {
-    const reduce = toNum(seedPhaseReduceMap.get(seedId), 0);
-    if (reduce <= 0) return growSec;
-    return Math.max(1, growSec - reduce);
-}
-
 function formatSec(sec) {
     const s = Math.max(0, Math.round(sec));
     if (s < 60) return `${s}s`;
@@ -156,19 +151,23 @@ function buildRows(rawSeeds, lands, seedPhaseReduceMap) {
         const requiredLevel = toNum(s.requiredLevel || s.required_level || 1, 1);
         const price = toNum(s.price, 0);
         const expHarvest = toNum(s.exp, 0);
-        const growTimeSec = toNum(s.growTimeSec || s.growTime || s.grow_time || 0, 0);
+        // `growTimeSec` in current seed data is total lifecycle time.
+        // For multi-season crops, total exp is still `exp * seasons`, but total time is not multiplied by seasons again.
+        const growTimeCycleSec = toNum(s.growTimeSec || s.growTime || s.grow_time || 0, 0);
+        const seasons = Math.max(1, Math.floor(toNum(s.seasons, 1)));
 
-        if (seedId <= 0 || growTimeSec <= 0) {
+        if (seedId <= 0 || growTimeCycleSec <= 0) {
             skipped++;
             continue;
         }
 
-        const expPerCycle = expHarvest;
+        const expPerCycle = expHarvest * seasons;
+        const growTimeSec = growTimeCycleSec;
         const reduceSec = toNum(seedPhaseReduceMap.get(seedId), 0);
         if (reduceSec <= 0) missingPhaseReduceCount++;
-        const growTimeNormalFert = calcEffectiveGrowTime(growTimeSec, seedId, seedPhaseReduceMap);
+        const growTimeNormalFert = Math.max(1, growTimeSec - reduceSec);
 
-        // 整个农场一轮 = 生长时间 + 本轮全部地块种植耗时
+        // 整个农场一轮 = 生命周期总生长时间 + 本轮全部地块种植耗时
         const cycleSecNoFert = growTimeSec + plantSecondsNoFert;
         const cycleSecNormalFert = growTimeNormalFert + plantSecondsNormalFert;
 
@@ -190,7 +189,9 @@ function buildRows(rawSeeds, lands, seedPhaseReduceMap) {
             expHarvest,
             expPerCycle,
             growTimeSec,
-            growTimeStr: s.growTimeStr || formatSec(growTimeSec),
+            growTimeStr: s.growTimeStr || formatSec(growTimeCycleSec),
+            growTimeCycleStr: formatSec(growTimeSec),
+            seasons,
             normalFertReduceSec: reduceSec,
             growTimeNormalFert,
             growTimeNormalFertStr: formatSec(growTimeNormalFert),
@@ -288,19 +289,19 @@ function writeSummaryTxt(outPath, opts, meta, topNo, topFert, levelInfo) {
     lines.push('');
 
     lines.push(`Top ${topNo.length}（不施肥，按每小时经验）`);
-    lines.push('排名 | 名称 | Lv需 | 生长 | 单轮经验 | 每小时经验');
+    lines.push('排名 | 名称 | Lv需 | 季数 | 单季生长 | 单轮生长 | 单轮经验 | 每小时经验');
     topNo.forEach((r, i) => {
         lines.push(
-            `${String(i + 1).padStart(2)} | ${r.name} | ${r.requiredLevel} | ${r.growTimeStr} | ${r.expPerCycle} | ${r.farmExpPerHourNoFert.toFixed(2)}`
+            `${String(i + 1).padStart(2)} | ${r.name} | ${r.requiredLevel} | ${r.seasons} | ${r.growTimeStr} | ${r.growTimeCycleStr} | ${r.expPerCycle} | ${r.farmExpPerHourNoFert.toFixed(2)}`
         );
     });
     lines.push('');
 
     lines.push(`Top ${topFert.length}（普通肥，按每小时经验）`);
-    lines.push('排名 | 名称 | Lv需 | 肥后生长 | 单轮经验 | 每小时经验 | 提升');
+    lines.push('排名 | 名称 | Lv需 | 季数 | 单季生长 | 肥后单轮生长 | 单轮经验 | 每小时经验 | 提升');
     topFert.forEach((r, i) => {
         lines.push(
-            `${String(i + 1).padStart(2)} | ${r.name} | ${r.requiredLevel} | ${r.growTimeNormalFertStr} | ${r.expPerCycle} | ${r.farmExpPerHourNormalFert.toFixed(2)} | ${r.gainPercent.toFixed(2)}%`
+            `${String(i + 1).padStart(2)} | ${r.name} | ${r.requiredLevel} | ${r.seasons} | ${r.growTimeStr} | ${r.growTimeNormalFertStr} | ${r.expPerCycle} | ${r.farmExpPerHourNormalFert.toFixed(2)} | ${r.gainPercent.toFixed(2)}%`
         );
     });
     lines.push('');
@@ -349,9 +350,12 @@ function analyzeExpYield(opts = {}) {
             plantSecondsNormalFert,
             fertilizer: {
                 mode: 'minus_one_phase',
+                applyCountPerLifecycle: 1,
             },
             rule: {
-                expPerCycle: 'expHarvest',
+                expPerCycle: 'expPerHarvest * seasons',
+                cycleGrowSec: 'growTimeSec_total_cycle',
+                expPerHarvestFrom: 'official_exp',
             },
         },
         stats: {
@@ -400,24 +404,36 @@ function getPlantingRecommendation(level, lands, opts = {}) {
             seedId: bestNoFertRow.seedId,
             name: bestNoFertRow.name,
             requiredLevel: bestNoFertRow.requiredLevel,
+            growTimeStr: bestNoFertRow.growTimeStr,
+            growTimeSec: bestNoFertRow.growTimeSec,
+            seasons: bestNoFertRow.seasons,
             expPerHour: Number(bestNoFertRow.farmExpPerHourNoFert.toFixed(4)),
         } : null,
         bestNormalFert: bestNormalFertRow ? {
             seedId: bestNormalFertRow.seedId,
             name: bestNormalFertRow.name,
             requiredLevel: bestNormalFertRow.requiredLevel,
+            growTimeStr: bestNormalFertRow.growTimeStr,
+            growTimeSec: bestNormalFertRow.growTimeSec,
+            seasons: bestNormalFertRow.seasons,
             expPerHour: Number(bestNormalFertRow.farmExpPerHourNormalFert.toFixed(4)),
         } : null,
         candidatesNoFert: pickTop(availableRows, 'farmExpPerHourNoFert', opts.top || 20).map(r => ({
             seedId: r.seedId,
             name: r.name,
             requiredLevel: r.requiredLevel,
+            growTimeStr: r.growTimeStr,
+            growTimeSec: r.growTimeSec,
+            seasons: r.seasons,
             expPerHour: Number(r.farmExpPerHourNoFert.toFixed(4)),
         })),
         candidatesNormalFert: pickTop(availableRows, 'farmExpPerHourNormalFert', opts.top || 20).map(r => ({
             seedId: r.seedId,
             name: r.name,
             requiredLevel: r.requiredLevel,
+            growTimeStr: r.growTimeStr,
+            growTimeSec: r.growTimeSec,
+            seasons: r.seasons,
             expPerHour: Number(r.farmExpPerHourNormalFert.toFixed(4)),
             gainPercent: Number(r.gainPercent.toFixed(4)),
         })),

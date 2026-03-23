@@ -46,7 +46,7 @@ function ensureStream() {
         currentDateKey = dateKey;
     } catch (err) {
         disabled = true;
-        process.stderr.write(`[logger] 初始化日志文件失败: ${err.message}\n`);
+        process.stderr.write(`[logger] failed to initialize log file: ${err.message}\n`);
     }
 }
 

@@ -42,6 +42,8 @@ async function loadProto() {
     // 农场
     types.AllLandsRequest = root.lookupType('gamepb.plantpb.AllLandsRequest');
     types.AllLandsReply = root.lookupType('gamepb.plantpb.AllLandsReply');
+    types.UpgradeLandRequest = root.lookupType('gamepb.plantpb.UpgradeLandRequest');
+    types.UpgradeLandReply = root.lookupType('gamepb.plantpb.UpgradeLandReply');
     types.HarvestRequest = root.lookupType('gamepb.plantpb.HarvestRequest');
     types.HarvestReply = root.lookupType('gamepb.plantpb.HarvestReply');
     types.WaterLandRequest = root.lookupType('gamepb.plantpb.WaterLandRequest');
@@ -82,6 +84,8 @@ async function loadProto() {
     types.GetApplicationsReply = root.lookupType('gamepb.friendpb.GetApplicationsReply');
     types.AcceptFriendsRequest = root.lookupType('gamepb.friendpb.AcceptFriendsRequest');
     types.AcceptFriendsReply = root.lookupType('gamepb.friendpb.AcceptFriendsReply');
+    types.DelFriendRequest = root.lookupType('gamepb.friendpb.DelFriendRequest');
+    types.DelFriendReply = root.lookupType('gamepb.friendpb.DelFriendReply');
 
     // 访问
     types.VisitEnterRequest = root.lookupType('gamepb.visitpb.EnterRequest');

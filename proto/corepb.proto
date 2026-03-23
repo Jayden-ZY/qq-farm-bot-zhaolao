@@ -23,5 +23,5 @@ message ItemBag {
 // ============ 物品变化 ============
 message ItemChg {
     Item item = 1;          // 物品信息
-    int64 delta = 2;        // 变化量 (正数增加, 负数减少)
+    int64 delta = 2;        // 变化量(正数增加, 负数减少)
 }

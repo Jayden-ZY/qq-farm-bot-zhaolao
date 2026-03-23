@@ -2,24 +2,47 @@
  * 配置常量与枚举定义
  */
 
+const DEFAULT_CLIENT_VERSION = '1.7.0.6_20260313';
+
 const CONFIG = {
     serverUrl: 'wss://gate-obt.nqf.qq.com/prod/ws',
-    clientVersion: '1.6.0.14_20251224',
+    clientVersion: DEFAULT_CLIENT_VERSION,
     platform: 'qq',              // 平台: qq 或 wx (可通过 --wx 切换为微信)
     os: 'iOS',
     heartbeatInterval: 25000,    // 心跳间隔 25秒
-    farmCheckInterval: 1000,     // 自己农场巡查完成后等待间隔 (可通过 --interval 修改, 最低1秒)
-    friendCheckInterval: 10000,  // 好友巡查完成后等待间隔 (可通过 --friend-interval 修改, 最低1秒)
+    passiveSessionSyncIntervalMs: 5 * 60 * 1000, // 参考官方会话，定期补发轻量同步请求
+    farmCheckInterval: 1000,     // 自己农场巡查完成后等待间隔 (可通过 --interval 修改, 最低0秒)
+    friendCheckInterval: 10000,  // 好友巡查完成后等待间隔 (可通过 --friend-interval 修改, 最低0秒)
     targetSeedId: 0,             // 指定种子ID: 0=自动选择(默认大萝卜)
     forceLowestLevelCrop: false, // 开启后固定种最低等级作物（通常是白萝卜），跳过经验效率分析
+    loginBodyFile: '',
+    loginSceneId: '1256',
+    loginReportData: {
+        callback: '',
+        cd_extend_info: '',
+        click_id: '',
+        clue_token: '',
+        minigame_channel: 'other',
+        minigame_platid: 2,
+        req_id: '',
+        trackid: '',
+    },
     device_info: {
-        client_version: '1.6.0.14_20251224',
-        sys_software: 'iOS 26.2.1',
+        client_version: DEFAULT_CLIENT_VERSION,
+        sys_software: 'iPhone OS 18.7',
         network: 'wifi',
         memory: '7672',
-        device_id: 'iPhone X<iPhone18,3>',
+        device_id: 'iPhone',
     },
 };
+
+function setClientVersion(nextVersion) {
+    const value = String(nextVersion || '').trim();
+    if (!value) return CONFIG.clientVersion;
+    CONFIG.clientVersion = value;
+    CONFIG.device_info.client_version = value;
+    return CONFIG.clientVersion;
+}
 
 // 运行期提示文案（做了简单编码，避免明文散落）
 const RUNTIME_HINT_MASK = 23;
@@ -45,8 +68,10 @@ const PHASE_NAMES = ['未知', '种子', '发芽', '小叶', '大叶', '开花',
 
 module.exports = {
     CONFIG,
+    DEFAULT_CLIENT_VERSION,
     PlantPhase,
     PHASE_NAMES,
     RUNTIME_HINT_MASK,
     RUNTIME_HINT_DATA,
+    setClientVersion,
 };

@@ -1,0 +1,12 @@
+# 用户数据（含密码哈希、游戏token、个人信息）
+data/
+
+# 依赖
+node_modules/
+
+# 日志
+*.log
+logs/
+
+# 进程锁
+*.lock
