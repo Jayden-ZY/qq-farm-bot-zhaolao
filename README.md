@@ -37,10 +37,73 @@
 ## 安装
 
 ```bash
-git clone https://github.com/linguo2625469/qq-farm-bot.git
+git clone https://github.com/tanhao612/qq-farm-bot.git
 cd qq-farm-bot
 npm install
 ```
+
+## 快速启动（Bot / WebUI）
+
+当前仓库内已经包含两个部分：
+
+- 仓库根目录下的主程序 Bot
+- `qq-farm-webui/` 目录下的 Web 管理界面
+
+### 运行 Bot
+
+在 `qq-farm-bot` 根目录执行：
+
+```bash
+# QQ 小程序：默认支持扫码登录
+node client.js
+
+# QQ 小程序：使用抓到的 code
+node client.js --code <你的登录code>
+
+# 微信小程序：需要显式加 --wx
+node client.js --code <你的登录code> --wx
+```
+
+如果你只想调整巡查间隔：
+
+```bash
+node client.js --code <code> --interval 5 --friend-interval 2
+```
+
+### 运行仓库内置 WebUI
+
+WebUI 目录：
+
+```text
+qq-farm-bot/qq-farm-webui
+```
+
+首次使用需要单独安装 WebUI 依赖：
+
+```bash
+cd qq-farm-webui
+npm install
+```
+
+启动 WebUI：
+
+```bash
+cd qq-farm-webui
+npm start
+```
+
+默认访问地址：
+
+```text
+http://localhost:3737
+```
+
+说明：
+
+- WebUI 只是管理界面，本体 Bot 仍然是 `client.js`
+- WebUI 会调用仓库里的 `start.sh` / `kill.sh` 来启动和停止 Bot
+- WebUI 的数据和日志目录在 `qq-farm-webui/data/`
+- 如果 WebUI 页面能打开但无法启动 Bot，优先检查根目录是否已经执行过 `npm install`
 
 ## 使用
 
