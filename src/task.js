@@ -1,5 +1,5 @@
 /**
- * Task system - auto claim normal tasks and illustrated rewards.
+ * Task system - auto claim task rewards.
  */
 
 const { types } = require('./proto');
@@ -130,7 +130,8 @@ async function checkAndClaimIllustratedRewards() {
     }
 }
 
-function scheduleIllustratedClaim(delay = 1000) {
+function scheduleIllustratedClaim(delay = 800) {
+    const safeDelay = Math.max(0, Number(delay) || 0);
     if (illustratedClaimTimer) {
         clearTimeout(illustratedClaimTimer);
     }
@@ -138,7 +139,7 @@ function scheduleIllustratedClaim(delay = 1000) {
     illustratedClaimTimer = setTimeout(async () => {
         illustratedClaimTimer = null;
         await checkAndClaimIllustratedRewards();
-    }, delay);
+    }, safeDelay);
 }
 
 async function claimTasksFromList(claimable) {
@@ -174,12 +175,10 @@ async function checkAndClaimTasks() {
         ];
 
         const claimable = analyzeTaskList(allTasks);
-        if (claimable.length > 0) {
-            log('任务', `发现 ${claimable.length} 个可领取任务`);
-            await claimTasksFromList(claimable);
-        }
+        if (claimable.length === 0) return;
 
-        await checkAndClaimIllustratedRewards();
+        log('任务', `发现 ${claimable.length} 个可领取任务`);
+        await claimTasksFromList(claimable);
     } catch (e) {
         // keep silent
     }
@@ -200,24 +199,17 @@ function onTaskInfoNotify(taskInfo) {
     log('任务', `有 ${claimable.length} 个任务可领取，准备自动领取...`);
     setTimeout(async () => {
         await claimTasksFromList(claimable);
-        await checkAndClaimIllustratedRewards();
     }, 1000);
-}
-
-function onIllustratedRewardNotify() {
-    scheduleIllustratedClaim(800);
 }
 
 function initTaskSystem() {
     cleanupTaskSystem();
     networkEvents.on('taskInfoNotify', onTaskInfoNotify);
-    networkEvents.on('illustratedRewardNotify', onIllustratedRewardNotify);
     setTimeout(() => checkAndClaimTasks(), 4000);
 }
 
 function cleanupTaskSystem() {
     networkEvents.off('taskInfoNotify', onTaskInfoNotify);
-    networkEvents.off('illustratedRewardNotify', onIllustratedRewardNotify);
     if (illustratedClaimTimer) {
         clearTimeout(illustratedClaimTimer);
         illustratedClaimTimer = null;
@@ -228,6 +220,7 @@ module.exports = {
     batchClaimTaskReward,
     checkAndClaimTasks,
     checkAndClaimIllustratedRewards,
+    scheduleIllustratedClaim,
     initTaskSystem,
     cleanupTaskSystem,
 };

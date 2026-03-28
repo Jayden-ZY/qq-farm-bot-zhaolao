@@ -690,16 +690,6 @@ function handleNotify(msg) {
             } catch (e) { }
             return;
         }
-        // Illustrated reward notification
-        if (type.includes('IllustratedRewardRedDotNotifyV2')) {
-            try {
-                if (types.IllustratedRewardRedDotNotifyV2) {
-                    types.IllustratedRewardRedDotNotifyV2.decode(eventBody);
-                }
-                networkEvents.emit('illustratedRewardNotify');
-            } catch (e) { }
-            return;
-        }
 
         // 鍏朵粬鏈鐞嗙殑鎺ㄩ€佺被鍨?(璋冭瘯鐢?
         // log('鎺ㄩ€?, `鏈鐞嗙被鍨? ${type}`);

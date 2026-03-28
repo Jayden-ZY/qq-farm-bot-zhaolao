@@ -23,6 +23,7 @@ const {
     getPlantByFruitId,
 } = require('./gameConfig');
 const { getPlantingRecommendation } = require('../tools/calc-exp-yield');
+const { scheduleIllustratedClaim } = require('./task');
 
 const _dataDir = process.env.QQ_FARM_DATA_DIR || null;
 const WEBUI_CONFIG_PATH = _dataDir
@@ -2013,6 +2014,7 @@ function syncFastHarvestTimers(soonToMature = []) {
 
             try {
                 await harvest([item.landId]);
+                scheduleIllustratedClaim(600);
                 log('秒收', `${item.plantName || `地块#${item.landId}`} 已触发秒收`);
                 scheduleFarmCheckSoon('秒收');
             } catch (e) {
@@ -3072,6 +3074,7 @@ async function checkFarm() {
                     clearFastHarvestTimer(landId);
                 }
                 await harvest(status.harvestable);
+                scheduleIllustratedClaim(600);
                 actions.push(`收获${status.harvestable.length}`);
                 harvestedLandIds = [...status.harvestable];
 
