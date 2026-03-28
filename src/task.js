@@ -9,6 +9,7 @@ const { getItemName } = require('./gameConfig');
 const { getBag, getBagItems } = require('./warehouse');
 
 let illustratedClaimTimer = null;
+let illustratedClaimInFlight = false;
 
 function extractErrorCode(err) {
     const msg = String((err && err.message) || err || '');
@@ -38,7 +39,7 @@ async function claimTaskReward(taskId, doShared = false) {
 
 async function batchClaimTaskReward(taskIds, doShared = false) {
     const body = types.BatchClaimTaskRewardRequest.encode(types.BatchClaimTaskRewardRequest.create({
-        ids: taskIds.map(id => toLong(id)),
+        ids: taskIds.map((id) => toLong(id)),
         do_shared: doShared,
     })).finish();
     const { body: replyBody } = await sendMsgAsync('gamepb.taskpb.TaskService', 'BatchClaimTaskReward', body);
@@ -104,7 +105,9 @@ async function getTicketBalanceFromBag() {
 
 async function checkAndClaimIllustratedRewards() {
     if (!types.ClaimAllRewardsV2Request || !types.ClaimAllRewardsV2Reply) return false;
+    if (illustratedClaimInFlight) return false;
 
+    illustratedClaimInFlight = true;
     try {
         const beforeTicket = await getTicketBalanceFromBag();
         const reply = await claimAllIllustratedRewards();
@@ -122,6 +125,8 @@ async function checkAndClaimIllustratedRewards() {
         return true;
     } catch (e) {
         return false;
+    } finally {
+        illustratedClaimInFlight = false;
     }
 }
 
@@ -134,6 +139,26 @@ function scheduleIllustratedClaim(delay = 1000) {
         illustratedClaimTimer = null;
         await checkAndClaimIllustratedRewards();
     }, delay);
+}
+
+async function claimTasksFromList(claimable) {
+    for (const task of claimable) {
+        try {
+            const useShare = task.shareMultiple > 1;
+            const multipleStr = useShare ? ` (${task.shareMultiple}倍)` : '';
+
+            const claimReply = await claimTaskReward(task.id, useShare);
+            const items = claimReply.items || [];
+            const rewardStr = items.length > 0 ? getRewardSummary(items) : '无';
+
+            log('任务', `领取: ${task.desc}${multipleStr} -> ${rewardStr}`);
+            await sleep(300);
+        } catch (e) {
+            if (!shouldIgnoreTaskClaimError(e)) {
+                logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
+            }
+        }
+    }
 }
 
 async function checkAndClaimTasks() {
@@ -170,10 +195,7 @@ function onTaskInfoNotify(taskInfo) {
     ];
 
     const claimable = analyzeTaskList(allTasks);
-    if (claimable.length === 0) {
-        scheduleIllustratedClaim();
-        return;
-    }
+    if (claimable.length === 0) return;
 
     log('任务', `有 ${claimable.length} 个任务可领取，准备自动领取...`);
     setTimeout(async () => {
@@ -184,26 +206,6 @@ function onTaskInfoNotify(taskInfo) {
 
 function onIllustratedRewardNotify() {
     scheduleIllustratedClaim(800);
-}
-
-async function claimTasksFromList(claimable) {
-    for (const task of claimable) {
-        try {
-            const useShare = task.shareMultiple > 1;
-            const multipleStr = useShare ? ` (${task.shareMultiple}倍)` : '';
-
-            const claimReply = await claimTaskReward(task.id, useShare);
-            const items = claimReply.items || [];
-            const rewardStr = items.length > 0 ? getRewardSummary(items) : '无';
-
-            log('任务', `领取: ${task.desc}${multipleStr} -> ${rewardStr}`);
-            await sleep(300);
-        } catch (e) {
-            if (!shouldIgnoreTaskClaimError(e)) {
-                logWarn('任务', `领取失败 #${task.id}: ${e.message}`);
-            }
-        }
-    }
 }
 
 function initTaskSystem() {
