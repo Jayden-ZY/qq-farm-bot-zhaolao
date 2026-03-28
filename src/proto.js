@@ -1,12 +1,11 @@
 /**
- * Proto 加载与消息类型管理
+ * Proto load and message type registry.
  */
 
 const protobuf = require('protobufjs');
 const path = require('path');
 const { log } = require('./utils');
 
-// Proto 根对象与所有消息类型
 let root = null;
 const types = {};
 
@@ -18,6 +17,7 @@ async function loadProto() {
         path.join(protoDir, 'userpb.proto'),
         path.join(protoDir, 'plantpb.proto'),
         path.join(protoDir, 'corepb.proto'),
+        path.join(protoDir, 'illustratedpb.proto'),
         path.join(protoDir, 'shoppb.proto'),
         path.join(protoDir, 'friendpb.proto'),
         path.join(protoDir, 'visitpb.proto'),
@@ -26,12 +26,12 @@ async function loadProto() {
         path.join(protoDir, 'itempb.proto'),
     ], { keepCase: true });
 
-    // 网关
+    // gateway
     types.GateMessage = root.lookupType('gatepb.Message');
     types.GateMeta = root.lookupType('gatepb.Meta');
     types.EventMessage = root.lookupType('gatepb.EventMessage');
 
-    // 用户
+    // user
     types.LoginRequest = root.lookupType('gamepb.userpb.LoginRequest');
     types.LoginReply = root.lookupType('gamepb.userpb.LoginReply');
     types.HeartbeatRequest = root.lookupType('gamepb.userpb.HeartbeatRequest');
@@ -39,7 +39,7 @@ async function loadProto() {
     types.ReportArkClickRequest = root.lookupType('gamepb.userpb.ReportArkClickRequest');
     types.ReportArkClickReply = root.lookupType('gamepb.userpb.ReportArkClickReply');
 
-    // 农场
+    // farm
     types.AllLandsRequest = root.lookupType('gamepb.plantpb.AllLandsRequest');
     types.AllLandsReply = root.lookupType('gamepb.plantpb.AllLandsReply');
     types.UpgradeLandRequest = root.lookupType('gamepb.plantpb.UpgradeLandRequest');
@@ -61,7 +61,7 @@ async function loadProto() {
     types.FertilizeRequest = root.lookupType('gamepb.plantpb.FertilizeRequest');
     types.FertilizeReply = root.lookupType('gamepb.plantpb.FertilizeReply');
 
-    // 背包/仓库
+    // bag / warehouse
     types.BagRequest = root.lookupType('gamepb.itempb.BagRequest');
     types.BagReply = root.lookupType('gamepb.itempb.BagReply');
     types.SellRequest = root.lookupType('gamepb.itempb.SellRequest');
@@ -69,7 +69,7 @@ async function loadProto() {
     types.PlantRequest = root.lookupType('gamepb.plantpb.PlantRequest');
     types.PlantReply = root.lookupType('gamepb.plantpb.PlantReply');
 
-    // 商店
+    // shop
     types.ShopProfilesRequest = root.lookupType('gamepb.shoppb.ShopProfilesRequest');
     types.ShopProfilesReply = root.lookupType('gamepb.shoppb.ShopProfilesReply');
     types.ShopInfoRequest = root.lookupType('gamepb.shoppb.ShopInfoRequest');
@@ -77,7 +77,7 @@ async function loadProto() {
     types.BuyGoodsRequest = root.lookupType('gamepb.shoppb.BuyGoodsRequest');
     types.BuyGoodsReply = root.lookupType('gamepb.shoppb.BuyGoodsReply');
 
-    // 好友
+    // friend
     types.GetAllFriendsRequest = root.lookupType('gamepb.friendpb.GetAllRequest');
     types.GetAllFriendsReply = root.lookupType('gamepb.friendpb.GetAllReply');
     types.GetApplicationsRequest = root.lookupType('gamepb.friendpb.GetApplicationsRequest');
@@ -87,21 +87,23 @@ async function loadProto() {
     types.DelFriendRequest = root.lookupType('gamepb.friendpb.DelFriendRequest');
     types.DelFriendReply = root.lookupType('gamepb.friendpb.DelFriendReply');
 
-    // 访问
+    // visit
     types.VisitEnterRequest = root.lookupType('gamepb.visitpb.EnterRequest');
     types.VisitEnterReply = root.lookupType('gamepb.visitpb.EnterReply');
     types.VisitLeaveRequest = root.lookupType('gamepb.visitpb.LeaveRequest');
     types.VisitLeaveReply = root.lookupType('gamepb.visitpb.LeaveReply');
 
-    // 任务
+    // task
     types.TaskInfoRequest = root.lookupType('gamepb.taskpb.TaskInfoRequest');
     types.TaskInfoReply = root.lookupType('gamepb.taskpb.TaskInfoReply');
     types.ClaimTaskRewardRequest = root.lookupType('gamepb.taskpb.ClaimTaskRewardRequest');
     types.ClaimTaskRewardReply = root.lookupType('gamepb.taskpb.ClaimTaskRewardReply');
     types.BatchClaimTaskRewardRequest = root.lookupType('gamepb.taskpb.BatchClaimTaskRewardRequest');
     types.BatchClaimTaskRewardReply = root.lookupType('gamepb.taskpb.BatchClaimTaskRewardReply');
+    types.ClaimAllRewardsV2Request = root.lookupType('gamepb.illustratedpb.ClaimAllRewardsV2Request');
+    types.ClaimAllRewardsV2Reply = root.lookupType('gamepb.illustratedpb.ClaimAllRewardsV2Reply');
 
-    // 服务器推送通知
+    // server push notifications
     types.LandsNotify = root.lookupType('gamepb.plantpb.LandsNotify');
     types.BasicNotify = root.lookupType('gamepb.userpb.BasicNotify');
     types.KickoutNotify = root.lookupType('gatepb.KickoutNotify');
@@ -110,8 +112,7 @@ async function loadProto() {
     types.ItemNotify = root.lookupType('gamepb.itempb.ItemNotify');
     types.GoodsUnlockNotify = root.lookupType('gamepb.shoppb.GoodsUnlockNotify');
     types.TaskInfoNotify = root.lookupType('gamepb.taskpb.TaskInfoNotify');
-
-    // Proto 加载完成
+    types.IllustratedRewardRedDotNotifyV2 = root.lookupType('gamepb.illustratedpb.IllustratedRewardRedDotNotifyV2');
 }
 
 function getRoot() {
