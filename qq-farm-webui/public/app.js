@@ -3040,6 +3040,27 @@ function renderLogs() {
     }
 }
 
+function updateOverviewBuy10hVisibility(options = {}) {
+    if (!el.btnOverviewBuy10h) return;
+
+    const isOnline = options.isOnline !== undefined
+        ? Boolean(options.isOnline)
+        : Boolean(state.runtime && state.runtime.running);
+    const autoFertilizeEnabled = el.autoFertilize
+        ? Boolean(el.autoFertilize.checked)
+        : !state.config || state.config.autoFertilize !== false;
+
+    el.btnOverviewBuy10h.hidden = autoFertilizeEnabled;
+    el.btnOverviewBuy10h.disabled = autoFertilizeEnabled || !isOnline;
+    el.btnOverviewBuy10h.title = autoFertilizeEnabled
+        ? '自动施肥开启时隐藏手动购买入口'
+        : (isOnline ? '购买10小时普通化肥' : 'bot 未运行，无法执行购买请求');
+
+    if (autoFertilizeEnabled && state.mallBuyModalOpen) {
+        closeMallBuyModal({ focusTrigger: false });
+    }
+}
+
 function renderFertilizerMetric(metrics) {
     if (!el.metricFertilizer) return;
 
@@ -3142,12 +3163,7 @@ function renderRuntime(runtime) {
             ? '尝试对所有地块执行一次升级接口（单步升级）'
             : 'bot 未运行，无法执行升级地块请求';
     }
-    if (el.btnOverviewBuy10h) {
-        el.btnOverviewBuy10h.disabled = !isOnline;
-        el.btnOverviewBuy10h.title = isOnline
-            ? '购买10小时普通化肥'
-            : 'bot 未运行，无法执行购买请求';
-    }
+    updateOverviewBuy10hVisibility({ isOnline });
     if (el.btnBagUseAll) {
         el.btnBagUseAll.disabled = !isOnline;
         el.btnBagUseAll.title = isOnline
@@ -3212,6 +3228,7 @@ function renderConfig(config) {
     setIntervalControl('friend', config.friendIntervalSec ?? 1);
     if (el.fastHarvest) el.fastHarvest.checked = config.fastHarvest !== false;
     if (el.autoFertilize) el.autoFertilize.checked = config.autoFertilize !== false;
+    updateOverviewBuy10hVisibility();
     if (el.friendActionSteal) el.friendActionSteal.checked = config.friendActionSteal !== false;
     const legacyCare = (config.friendActionWater !== false)
         || (config.friendActionWeed !== false)
@@ -3860,6 +3877,9 @@ function bindEvents() {
                     setFriendApplyAllDayState(false, { syncInputs: false });
                 }
             }
+            if (node === el.autoFertilize) {
+                updateOverviewBuy10hVisibility();
+            }
             scheduleConfigAutoSave(isTextLike ? 260 : 120);
         });
         node.addEventListener('change', () => {
@@ -3876,6 +3896,9 @@ function bindEvents() {
                 if (el.friendApplyAllDay && el.friendApplyAllDay.checked) {
                     setFriendApplyAllDayState(false, { syncInputs: false });
                 }
+            }
+            if (node === el.autoFertilize) {
+                updateOverviewBuy10hVisibility();
             }
             scheduleConfigAutoSave(0);
         });
@@ -4197,3 +4220,4 @@ async function main() {
 }
 
 main();
+

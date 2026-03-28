@@ -429,7 +429,7 @@
                                         <input id="autoFertilize" name="autoFertilize" type="checkbox" checked />
                                         <span>自动施肥</span>
                                     </label>
-                                    <p class="field-note">距离成熟 60 秒内会预设抢收任务，默认提前 200ms 发起收获请求。普通化肥不足时会自动关闭“自动施肥”。</p>
+                                    <p class="field-note">距离成熟 60 秒内会预设抢收任务，默认提前 200ms 发起收获请求。普通化肥不足时会暂停施肥并尝试自动补到 10 小时；只有你手动关闭时，自动施肥才会真正停用。</p>
                                 </div>
                             </section>
 
@@ -773,3 +773,4 @@
     <script src="/app.js" defer></script>
 </body>
 </html>
+

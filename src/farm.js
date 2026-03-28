@@ -85,6 +85,12 @@ let startupMallDailyClaimQueued = false;
 let lastMallDailyAutoClaimDateKey = '';
 let farmFastHarvestEnabled = true;
 let farmAutoFertilizeEnabled = true;
+let lastKnownNormalFertilizerSec = null;
+let lastKnownNormalFertilizerAt = 0;
+let lastKnownDiamondCount = null;
+let lastKnownDiamondAt = 0;
+let lastNormalFertilizerAutoBuyAttemptAt = 0;
+let lastNormalFertilizerLowLogAt = 0;
 const fastHarvestTimers = new Map(); // landId -> { timer, matureTime, plantName }
 const FERT_STATUS_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 每 5 分钟主动上报一次肥料状态
 const LAND_UPGRADE_MANUAL_REQUEST_MAX_AGE_MS = 60 * 60 * 1000;
@@ -100,9 +106,22 @@ const LAND_GRID_COLUMNS = 4;
 const LARGE_CROP_SIZE = 2;
 const KNOWN_LARGE_SEED_IDS = new Set([20046, 20092, 20219, 29998]);
 const KNOWN_LARGE_SEED_NAMES = new Set(['哈哈南瓜', '路易十四', '爱心果', '稀世琉璃果']);
+const DIAMOND_ITEM_IDS = new Set([2, 1002]);
+const NORMAL_FERTILIZER_BAG_USE_ITEM_SECONDS = new Map([
+    [80001, 1 * 60 * 60],
+    [80002, 4 * 60 * 60],
+    [80003, 8 * 60 * 60],
+    [80004, 12 * 60 * 60],
+    [100003, 1 * 60 * 60], // 化肥礼包：按 1 小时普通化肥估算，下一轮会继续消化礼包产物
+]);
 const MALL_GOODS_DAILY_FREE_ID = 1001; // 每日福利
 const MALL_GOODS_FERT_10H_NORMAL_ID = 1003; // 10小时化肥
 const MALL_PRICE_FERT_10H_NORMAL = 34; // 抓包实测单价（点券）
+const NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC = 10 * 60 * 60; // 低于 10 小时时尝试补充
+const NORMAL_FERTILIZER_STATUS_REFRESH_INTERVAL_MS = 60 * 1000;
+const NORMAL_FERTILIZER_AUTO_BUY_COOLDOWN_MS = 60 * 1000;
+const NORMAL_FERTILIZER_LOW_LOG_INTERVAL_MS = 5 * 60 * 1000;
+const NORMAL_FERTILIZER_AUTO_USE_MAX_ROUNDS = 4;
 const SHARE_DAILY_ACTION_FLAG = 1; // 分享场景标记（抓包实测固定为 1）
 const MALL_DEFAULT_BUY_10H_COUNT = 1;
 const MALL_MAX_BUY_10H_COUNT = 999;
@@ -1153,6 +1172,230 @@ async function openSelectedBagItems(selectedItems, reason = 'manual') {
     }
 }
 
+function updateKnownNormalFertilizerSec(value) {
+    if (!Number.isFinite(value) || value < 0) return lastKnownNormalFertilizerSec;
+    lastKnownNormalFertilizerSec = Math.floor(value);
+    lastKnownNormalFertilizerAt = Date.now();
+    return lastKnownNormalFertilizerSec;
+}
+
+function updateKnownDiamondCount(value) {
+    if (!Number.isFinite(value) || value < 0) return lastKnownDiamondCount;
+    lastKnownDiamondCount = Math.floor(value);
+    lastKnownDiamondAt = Date.now();
+    return lastKnownDiamondCount;
+}
+
+function getNormalFertilizerCountFromItems(items) {
+    for (const item of Array.isArray(items) ? items : []) {
+        if (toNum(item && item.id) === NORMAL_FERTILIZER_ID) {
+            const count = toNum(item && item.count);
+            return Number.isFinite(count) && count >= 0 ? count : 0;
+        }
+    }
+    return 0;
+}
+
+function getDiamondCountFromItems(items) {
+    for (const item of Array.isArray(items) ? items : []) {
+        const id = toNum(item && item.id);
+        if (DIAMOND_ITEM_IDS.has(id)) {
+            const count = toNum(item && item.count);
+            return Number.isFinite(count) && count >= 0 ? count : null;
+        }
+    }
+    return null;
+}
+
+function rememberBagDerivedRuntimeStatus(items) {
+    const remainSec = getNormalFertilizerCountFromItems(items);
+    const diamond = getDiamondCountFromItems(items);
+    updateKnownNormalFertilizerSec(remainSec);
+    if (Number.isFinite(diamond)) {
+        updateKnownDiamondCount(diamond);
+    }
+    return {
+        remainSec,
+        diamond: Number.isFinite(diamond) ? diamond : lastKnownDiamondCount,
+    };
+}
+
+function isNormalFertilizerBagUseCandidate(item) {
+    if (!item) return false;
+    const id = Math.floor(toNum(item.id));
+    const count = Math.max(0, Math.floor(toNum(item.count)));
+    const uid = Math.max(0, Math.floor(toNum(item.uid)));
+    if (id <= 0 || count <= 0 || uid <= 0) return false;
+    const info = getItemInfoById(id);
+    const interactionType = String((info && info.interaction_type) || '').trim().toLowerCase();
+    return interactionType === 'fertilizer' || id === 100003;
+}
+
+function getNormalFertilizerBagUseItemSeconds(itemId) {
+    return Math.max(0, Math.floor(toNum(NORMAL_FERTILIZER_BAG_USE_ITEM_SECONDS.get(Math.floor(toNum(itemId))) || 0)));
+}
+
+function buildNormalFertilizerUseSelection(items, targetRemainSec = NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC) {
+    const currentRemainSec = getNormalFertilizerCountFromItems(items);
+    if (!Number.isFinite(currentRemainSec) || currentRemainSec >= targetRemainSec) return [];
+
+    let gapSec = Math.max(0, Math.floor(targetRemainSec - currentRemainSec));
+    const candidates = (Array.isArray(items) ? items : [])
+        .filter(isNormalFertilizerBagUseCandidate)
+        .map((item) => ({
+            id: Math.floor(toNum(item.id)),
+            uid: Math.max(0, Math.floor(toNum(item.uid))),
+            count: Math.max(0, Math.floor(toNum(item.count))),
+            isNew: Boolean(item.is_new),
+            secondsPerUse: getNormalFertilizerBagUseItemSeconds(item.id),
+        }))
+        .filter((item) => item.id > 0 && item.uid > 0 && item.count > 0 && item.secondsPerUse > 0)
+        .sort((a, b) => b.secondsPerUse - a.secondsPerUse || a.id - b.id || a.uid - b.uid);
+
+    const selected = [];
+    for (const item of candidates) {
+        const needCount = Math.max(1, Math.ceil(gapSec / item.secondsPerUse));
+        const useCount = Math.min(item.count, needCount);
+        if (useCount <= 0) continue;
+        selected.push({
+            id: item.id,
+            uid: item.uid,
+            count: useCount,
+            name: getItemName(item.id),
+            isNew: item.isNew,
+        });
+        gapSec -= useCount * item.secondsPerUse;
+        if (gapSec <= 0) break;
+    }
+
+    return selected;
+}
+
+async function useNormalFertilizerBagItemsToThreshold(targetRemainSec = NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC, reason = 'auto', maxRounds = NORMAL_FERTILIZER_AUTO_USE_MAX_ROUNDS) {
+    let touchedBag = false;
+    let remainSec = lastKnownNormalFertilizerSec;
+    let diamond = lastKnownDiamondCount;
+
+    for (let round = 1; round <= maxRounds; round++) {
+        const items = await fetchBagItems();
+        const status = rememberBagDerivedRuntimeStatus(items);
+        remainSec = status.remainSec;
+        diamond = status.diamond;
+        const selectedItems = buildNormalFertilizerUseSelection(items, targetRemainSec);
+        if (selectedItems.length <= 0) {
+            break;
+        }
+        await openSelectedBagItems(selectedItems, `${reason}#${round}`);
+        touchedBag = true;
+        await sleep(40);
+    }
+
+    if (touchedBag) {
+        const items = await fetchBagItems();
+        const status = rememberBagDerivedRuntimeStatus(items);
+        remainSec = status.remainSec;
+        diamond = status.diamond;
+    }
+
+    return { touchedBag, remainSec, diamond };
+}
+
+function logAutoFertilizeWaitingForNormalFertilizer(reason = 'normal fertilizer low') {
+    const now = Date.now();
+    if (now - lastNormalFertilizerLowLogAt < NORMAL_FERTILIZER_LOW_LOG_INTERVAL_MS) return false;
+    lastNormalFertilizerLowLogAt = now;
+    log('施肥', `自动施肥保持开启：当前普通化肥不足，暂时跳过 (${reason})；补充后会自动恢复`);
+    return true;
+}
+
+async function maybeMaintainNormalFertilizerReserve(reason = 'auto-loop') {
+    if (!farmAutoFertilizeEnabled) return false;
+
+    let remainSec = lastKnownNormalFertilizerSec;
+    let diamond = lastKnownDiamondCount;
+    const now = Date.now();
+    const statusStale = !Number.isFinite(remainSec)
+        || !Number.isFinite(diamond)
+        || (now - Math.max(lastKnownNormalFertilizerAt, lastKnownDiamondAt)) >= NORMAL_FERTILIZER_STATUS_REFRESH_INTERVAL_MS;
+
+    if (statusStale) {
+        try {
+            const items = await fetchBagItems();
+            const status = rememberBagDerivedRuntimeStatus(items);
+            remainSec = status.remainSec;
+            diamond = status.diamond;
+        } catch (e) {
+            if (Number.isFinite(remainSec) && remainSec > 0) return true;
+            logAutoFertilizeWaitingForNormalFertilizer(`status-refresh-failed ${normalizeUpgradeErrorText(e)}`);
+            return false;
+        }
+    }
+
+    if (Number.isFinite(remainSec) && remainSec < NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC) {
+        try {
+            const useResult = await useNormalFertilizerBagItemsToThreshold(
+                NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC,
+                `auto-fertilizer-topup ${reason}`
+            );
+            remainSec = useResult.remainSec;
+            diamond = useResult.diamond;
+            if (useResult.touchedBag) {
+                try {
+                    await refreshBagSnapshot('after-use');
+                } catch (e) {
+                    logWarn('道具', `使用后刷新背包快照失败: ${normalizeUpgradeErrorText(e)}`);
+                }
+                await reportFertilizerStatus({ force: true });
+                remainSec = lastKnownNormalFertilizerSec;
+                diamond = lastKnownDiamondCount;
+            }
+        } catch (e) {
+            logWarn('道具', `普通化肥自动补充失败: ${normalizeUpgradeErrorText(e)}`);
+        }
+    }
+
+    if (
+        Number.isFinite(remainSec)
+        && remainSec < NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC
+        && Number.isFinite(diamond)
+        && diamond > MALL_PRICE_FERT_10H_NORMAL
+    ) {
+        const canTryBuy = (Date.now() - lastNormalFertilizerAutoBuyAttemptAt) >= NORMAL_FERTILIZER_AUTO_BUY_COOLDOWN_MS;
+        if (canTryBuy) {
+            lastNormalFertilizerAutoBuyAttemptAt = Date.now();
+            try {
+                await buyMallNormalFert10h(1, `auto-fertilizer-topup ${reason}`);
+                await sleep(40);
+                const useResult = await useNormalFertilizerBagItemsToThreshold(
+                    NORMAL_FERTILIZER_REPLENISH_THRESHOLD_SEC,
+                    `after-buy-10h auto ${reason}`
+                );
+                remainSec = useResult.remainSec;
+                diamond = useResult.diamond;
+                if (useResult.touchedBag) {
+                    try {
+                        await refreshBagSnapshot('after-use');
+                    } catch (e) {
+                        logWarn('道具', `使用后刷新背包快照失败: ${normalizeUpgradeErrorText(e)}`);
+                    }
+                }
+                await reportFertilizerStatus({ force: true });
+                remainSec = lastKnownNormalFertilizerSec;
+                diamond = lastKnownDiamondCount;
+            } catch (e) {
+                logWarn('商城', `普通化肥自动购买失败: ${normalizeUpgradeErrorText(e)}`);
+            }
+        }
+    }
+
+    if (Number.isFinite(remainSec) && remainSec <= 0) {
+        logAutoFertilizeWaitingForNormalFertilizer(reason);
+        return false;
+    }
+
+    return !Number.isFinite(remainSec) || remainSec > 0;
+}
+
 async function runPendingMallAndItemActions() {
     let touchedBag = false;
     let needFertilizerStatusRefresh = false;
@@ -1293,13 +1536,8 @@ const NORMAL_FERTILIZER_ID = 1011;
 async function getNormalFertilizerCount() {
     try {
         const items = await fetchBagItems();
-        for (const item of items) {
-            if (toNum(item.id) === NORMAL_FERTILIZER_ID) {
-                const count = toNum(item.count);
-                return Number.isFinite(count) && count >= 0 ? count : 0;
-            }
-        }
-        return 0;
+        const status = rememberBagDerivedRuntimeStatus(items);
+        return status.remainSec;
     } catch (e) {
         return null;
     }
@@ -1310,8 +1548,14 @@ async function getNormalFertilizerCount() {
  * 游戏中拖动施肥间隔很短，这里用 50ms
  */
 async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
-    if (fertilizerId === NORMAL_FERTILIZER_ID && !farmAutoFertilizeEnabled) {
-        return 0;
+    if (fertilizerId === NORMAL_FERTILIZER_ID) {
+        if (!farmAutoFertilizeEnabled) {
+            return 0;
+        }
+        const canAutoFertilize = await maybeMaintainNormalFertilizerReserve('before-fertilize');
+        if (!canAutoFertilize) {
+            return 0;
+        }
     }
 
     let successCount = 0;
@@ -1329,6 +1573,7 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
                     const remainSec = toNum(reply.fertilizer);
                     if (Number.isFinite(remainSec) && remainSec >= 0) {
                         lastFertilizerRemainSec = remainSec;
+                        updateKnownNormalFertilizerSec(remainSec);
                     }
                 } catch (e) {
                     // 忽略解码失败，后续走 Bag 查询兜底
@@ -1344,21 +1589,23 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
 
     if (fertilizerId === NORMAL_FERTILIZER_ID && landIds.length > 0) {
         if (Number.isFinite(lastFertilizerRemainSec)) {
+            updateKnownNormalFertilizerSec(lastFertilizerRemainSec);
             if (lastFertilizerRemainSec > 0) {
                 log('施肥', `FERT_STATUS normal_sec=${lastFertilizerRemainSec}`);
             } else {
                 log('施肥', 'FERT_STATUS low normal_sec=0');
-                disableAutoFertilizeDueToLow('normal fertilizer low normal_sec=0');
+                logAutoFertilizeWaitingForNormalFertilizer('normal fertilizer low normal_sec=0');
             }
             lastFertStatusLogAt = Date.now();
         } else {
             const remaining = await getNormalFertilizerCount();
             if (Number.isFinite(remaining)) {
+                updateKnownNormalFertilizerSec(remaining);
                 if (remaining > 0) {
                     log('施肥', `FERT_STATUS normal_count=${remaining}`);
                 } else {
                     log('施肥', 'FERT_STATUS low normal_count=0');
-                    disableAutoFertilizeDueToLow('normal fertilizer low normal_count=0');
+                    logAutoFertilizeWaitingForNormalFertilizer('normal fertilizer low normal_count=0');
                 }
                 lastFertStatusLogAt = Date.now();
             } else if (successCount >= landIds.length) {
@@ -1376,10 +1623,11 @@ async function reportFertilizerStatus(options = {}) {
     const { force = false } = options || {};
     if (!force && Date.now() - lastFertStatusLogAt < FERT_STATUS_CHECK_INTERVAL_MS) return;
     try {
-        const count = await getNormalFertilizerCount();
-        if (Number.isFinite(count)) {
-            if (count > 0) {
-                log('施肥', `FERT_STATUS normal_count=${count}`);
+        const items = await fetchBagItems();
+        const status = rememberBagDerivedRuntimeStatus(items);
+        if (Number.isFinite(status.remainSec)) {
+            if (status.remainSec > 0) {
+                log('施肥', `FERT_STATUS normal_count=${status.remainSec}`);
             } else {
                 log('施肥', 'FERT_STATUS low normal_count=0');
             }
@@ -1535,12 +1783,7 @@ function writeWebuiConfigPatch(patch = {}) {
 }
 
 function disableAutoFertilizeDueToLow(reason = 'normal fertilizer low') {
-    if (!farmAutoFertilizeEnabled) return false;
-    farmAutoFertilizeEnabled = false;
-    writeWebuiConfigPatch({ autoFertilize: false });
-    logWarn('施肥', `autoFertilize auto-disabled (${reason})`);
-    log('施肥', '检测到普通化肥不足，已自动关闭自动施肥，请补充后手动重新开启');
-    return true;
+    return logAutoFertilizeWaitingForNormalFertilizer(reason);
 }
 
 function getLatestUnlockedLandCountForRecommendation() {
@@ -2699,6 +2942,9 @@ async function checkFarm() {
         maybeQueueDailyMallClaim();
         applyRuntimeFarmConfig();
         await runPendingMallAndItemActions();
+        if (farmAutoFertilizeEnabled) {
+            await maybeMaintainNormalFertilizerReserve('loop');
+        }
         await reportFertilizerStatusIfStale();
 
         const landsReply = await getAllLands();
@@ -2741,7 +2987,9 @@ async function checkFarm() {
         if (status.empty.length) statusParts.push(`空:${status.empty.length}`);
         statusParts.push(`长:${status.growing.length}`);
 
-        const shouldAutoFertilize = farmAutoFertilizeEnabled && status.needFertilize.length > 0;
+        const shouldAutoFertilize = farmAutoFertilizeEnabled
+            && status.needFertilize.length > 0
+            && (!Number.isFinite(lastKnownNormalFertilizerSec) || lastKnownNormalFertilizerSec > 0);
         const hasWork = status.harvestable.length || status.needWeed.length || status.needBug.length
             || status.needWater.length || shouldAutoFertilize || status.dead.length || status.empty.length;
 
