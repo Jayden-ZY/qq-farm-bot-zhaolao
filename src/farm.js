@@ -101,7 +101,7 @@ const FARM_NETWORK_GUARD_MAX_MS = 2200;
 const FAST_HARVEST_PREPARE_WINDOW_SEC = 60;
 const FAST_HARVEST_EARLY_TRIGGER_MS = 200;
 const FARM_UNLOCK_LAND_MAX_ID = 24;
-const LAND_UNLOCK_REQUEST_SOURCE = 13; // 来自实测抓包：UnlockLand 请求第二字段固定为 13
+const LAND_UNLOCK_REQUEST_SOURCE = 0; // 抓包解密样本为 080c1000 / 080d1000，UnlockLand 请求第二字段固定为 0
 const LAND_GRID_COLUMNS = 4;
 const LARGE_CROP_SIZE = 2;
 const KNOWN_LARGE_SEED_IDS = new Set([20046, 20092, 20219, 29998]);
@@ -2776,13 +2776,12 @@ async function tryUpgradeAllLandsOnce(lands, reason = 'manual') {
     try {
         let workingLands = Array.isArray(lands) ? lands : [];
         let unlockedCount = workingLands.filter((land) => land && land.unlocked).length;
-        const canTryUnlock = unlockedCount < FARM_UNLOCK_LAND_MAX_ID;
-
-        if (canTryUnlock) {
-            log('升级土地', `开始(${reason}): 已解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块，先尝试自动解锁`);
-        } else {
-            log('升级土地', `开始(${reason}): 已解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块，直接尝试升级等级`);
-        }
+        log(
+            '升级土地',
+            unlockedCount < FARM_UNLOCK_LAND_MAX_ID
+                ? `开始(${reason}): 已解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块，按抓包逻辑持续尝试扩建`
+                : `开始(${reason}): 已解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块，开始尝试升级等级`
+        );
 
         let success = 0;
         let fail = 0;
@@ -2791,6 +2790,20 @@ async function tryUpgradeAllLandsOnce(lands, reason = 'manual') {
         const codeStats = new Map();
         const reasonStats = new Map();
         const failSamples = [];
+        let skippedUpgradeBecauseNotFull = false;
+        const refreshWorkingLands = async (warnText = '') => {
+            try {
+                const refreshed = await getAllLands();
+                if (refreshed && Array.isArray(refreshed.lands) && refreshed.lands.length > 0) {
+                    workingLands = refreshed.lands;
+                }
+            } catch (e) {
+                if (warnText) {
+                    logWarn('升级土地', `${warnText}: ${e.message || String(e)}`);
+                }
+            }
+            return workingLands;
+        };
         const collectFail = (landId, err) => {
             fail++;
             const code = extractErrorCode(err);
@@ -2805,8 +2818,10 @@ async function tryUpgradeAllLandsOnce(lands, reason = 'manual') {
             }
         };
 
-        // 阶段1：自动解锁（每轮只尝试 1 块，再进入升级阶段；更贴近实测交互）
-        if (canTryUnlock) {
+        // 阶段1：未满 24 块时只做扩建，并持续尝试到无法继续为止。
+        let unlockRounds = 0;
+        while (unlockedCount < FARM_UNLOCK_LAND_MAX_ID && unlockRounds < FARM_UNLOCK_LAND_MAX_ID) {
+            unlockRounds++;
             const nextLockedLand = workingLands
                 .filter((land) => land && !land.unlocked && toNum(land.id) > 0)
                 .sort((a, b) => toNum(a.id) - toNum(b.id))[0];
@@ -2815,79 +2830,101 @@ async function tryUpgradeAllLandsOnce(lands, reason = 'manual') {
                 attempted++;
                 try {
                     await unlockLand(landId);
-                    const refreshed = await getAllLands();
-                    if (refreshed && Array.isArray(refreshed.lands) && refreshed.lands.length > 0) {
-                        workingLands = refreshed.lands;
-                    }
+                    await sleep(80);
+                    await refreshWorkingLands('解锁后刷新地块快照失败');
 
+                    const beforeUnlockedCount = unlockedCount;
                     const afterUnlockedCount = workingLands.filter((land) => land && land.unlocked).length;
-                    if (afterUnlockedCount <= unlockedCount) {
+                    if (afterUnlockedCount <= beforeUnlockedCount) {
                         const err = new Error('解锁未生效');
                         collectFail(landId, err);
                         logWarn('升级土地', `解锁地块#${landId} 未生效，停止继续解锁`);
+                        break;
                     } else {
                         unlockedCount = afterUnlockedCount;
                         success++;
                         touchedIds.push(`#${landId}(解锁)`);
                         log('升级土地', `解锁地块#${landId} 成功（已解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}）`);
-                        await sleep(80);
+                        if (unlockedCount < FARM_UNLOCK_LAND_MAX_ID) {
+                            await sleep(80);
+                        }
                     }
                 } catch (e) {
                     collectFail(landId, e);
                     logWarn('升级土地', `解锁地块#${landId} 失败: ${normalizeUpgradeErrorText(e)}（停止继续解锁）`);
+                    break;
                 }
+            } else {
+                break;
             }
         }
 
-        // 阶段2：升级已解锁土地等级
-        const upgradeCandidates = workingLands
-            .filter((land) => land && land.unlocked && toNum(land.id) > 0)
-            .filter((land) => {
-                const level = toNum(land.level);
-                const maxLevel = Math.max(level, toNum(land.max_level));
-                return maxLevel > 0 && level < maxLevel;
-            })
-            .sort((a, b) => {
-                const aHint = a.could_upgrade ? 0 : 1;
-                const bHint = b.could_upgrade ? 0 : 1;
-                if (aHint !== bHint) return aHint - bHint;
-                const lvDiff = toNum(a.level) - toNum(b.level);
-                if (lvDiff !== 0) return lvDiff;
-                return toNum(a.id) - toNum(b.id);
-            });
-
-        if (upgradeCandidates.length > 0) {
-            log('升级土地', `升级阶段: 候选${upgradeCandidates.length}块`);
+        // 阶段2：只有满 24 块后才尝试升级土地等级，并持续扫到做不了为止。
+        if (unlockedCount < FARM_UNLOCK_LAND_MAX_ID) {
+            skippedUpgradeBecauseNotFull = true;
+            log('升级土地', `当前仅解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块，跳过升级阶段`);
         }
 
-        for (const land of upgradeCandidates) {
-            const landId = toNum(land.id);
-            if (landId <= 0) continue;
-            attempted++;
-            try {
-                await upgradeLand(landId);
-                success++;
-                touchedIds.push(`#${landId}(升级)`);
-            } catch (e) {
-                collectFail(landId, e);
+        let upgradePass = 0;
+        while (unlockedCount >= FARM_UNLOCK_LAND_MAX_ID && upgradePass < 32) {
+            upgradePass++;
+            const upgradeCandidates = workingLands
+                .filter((land) => land && land.unlocked && toNum(land.id) > 0)
+                .filter((land) => {
+                    const level = toNum(land.level);
+                    const maxLevel = Math.max(level, toNum(land.max_level));
+                    return maxLevel > 0 && level < maxLevel;
+                })
+                .sort((a, b) => {
+                    const aHint = a.could_upgrade ? 0 : 1;
+                    const bHint = b.could_upgrade ? 0 : 1;
+                    if (aHint !== bHint) return aHint - bHint;
+                    const lvDiff = toNum(a.level) - toNum(b.level);
+                    if (lvDiff !== 0) return lvDiff;
+                    return toNum(a.id) - toNum(b.id);
+                });
+
+            if (upgradeCandidates.length <= 0) {
+                break;
             }
-            if (upgradeCandidates.length > 1) await sleep(80);
+
+            log('升级土地', `升级阶段#${upgradePass}: 候选${upgradeCandidates.length}块`);
+            let passSuccess = 0;
+            for (const land of upgradeCandidates) {
+                const landId = toNum(land.id);
+                if (landId <= 0) continue;
+                attempted++;
+                try {
+                    await upgradeLand(landId);
+                    success++;
+                    passSuccess++;
+                    touchedIds.push(`#${landId}(升级)`);
+                } catch (e) {
+                    collectFail(landId, e);
+                }
+                if (upgradeCandidates.length > 1) await sleep(80);
+            }
+
+            if (passSuccess <= 0) {
+                break;
+            }
+
+            await sleep(80);
+            await refreshWorkingLands('升级后刷新地块快照失败');
         }
 
         let refreshedLands = workingLands;
         if (success > 0) {
-            try {
-                const refreshed = await getAllLands();
-                if (refreshed && Array.isArray(refreshed.lands) && refreshed.lands.length > 0) {
-                    refreshedLands = refreshed.lands;
-                }
-            } catch (e) {
-                logWarn('升级土地', `刷新地块快照失败: ${e.message || String(e)}`);
-            }
+            refreshedLands = await refreshWorkingLands('刷新地块快照失败');
         }
 
         if (attempted === 0) {
-            log('升级土地', `跳过(${reason}): 无可解锁/可升级地块`);
+            log(
+                '升级土地',
+                skippedUpgradeBecauseNotFull
+                    ? `跳过(${reason}): 仅解锁${unlockedCount}/${FARM_UNLOCK_LAND_MAX_ID}块`
+                    : `跳过(${reason}): 无可解锁/可升级地块`
+            );
             return { success: 0, fail: 0, skipped: false, refreshedLands };
         }
 
@@ -2967,6 +3004,10 @@ async function checkFarm() {
             const sweepResult = await tryUpgradeAllLandsOnce(lands, sweepReason);
             if (sweepResult && Array.isArray(sweepResult.refreshedLands) && sweepResult.refreshedLands.length > 0) {
                 lands = sweepResult.refreshedLands;
+            }
+            if (sweepResult && sweepResult.success > 0 && /level-up|manual-button/i.test(sweepReason)) {
+                const unlockedForCalc = lands.filter((land) => land && land.unlocked).length;
+                applyPreferredSeedTargetByNormalFert(state.level, unlockedForCalc, `after-upgrade ${sweepReason}`);
             }
         }
 
@@ -3189,3 +3230,5 @@ module.exports = {
     requestLandUpgradeSweep: queueLandUpgradeSweep,
     tryUpgradeAllLandsOnce,
 };
+
+

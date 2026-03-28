@@ -60,9 +60,10 @@ function ensurePassiveSessionSync(sendMsgAsync, intervalMs) {
 async function runLoginWarmup({ sendMsgAsync, types, sleep, profile, passiveSyncIntervalMs }) {
     const steps = [
         {
-            serviceName: 'gamepb.userpb.UserService',
-            methodName: 'GetUserSettings',
-            body: Buffer.alloc(0),
+            // Mirror the captured startup flow: fetch the friend summary early.
+            serviceName: 'gamepb.friendpb.FriendService',
+            methodName: 'GetAll',
+            body: types.GetAllFriendsRequest.encode(types.GetAllFriendsRequest.create({})).finish(),
         },
         {
             serviceName: 'gamepb.plantpb.PlantService',
@@ -87,6 +88,11 @@ async function runLoginWarmup({ sendMsgAsync, types, sleep, profile, passiveSync
         {
             serviceName: 'gamepb.sharepb.ShareService',
             methodName: 'GetInviteInfo',
+            body: Buffer.alloc(0),
+        },
+        {
+            serviceName: 'gamepb.userpb.UserService',
+            methodName: 'GetUserSettings',
             body: Buffer.alloc(0),
         },
     ];
